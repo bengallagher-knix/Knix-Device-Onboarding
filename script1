@@ -1,0 +1,2437 @@
+<#
+.SYNOPSIS
+    Knix Windows device onboarding - single idempotent Atera script.
+
+.DESCRIPTION
+    Replaces six separate Atera scripts with one run. Every step is:
+      - Idempotent      : checks state first, acts only when something is wrong.
+      - Isolated        : a failure or hang in one step can never stop the others.
+      - Time-boxed      : every external process and download has a hard timeout
+                          and is killed (process tree) if it overruns.
+      - Logged          : C:\ProgramData\Knix\Logs\Onboarding.log plus an Atera
+                          summary table at the end.
+      - Alerted         : posts failures (and optionally every run) to Slack via
+                          a bot token. See the SLACK ALERTING block at the top.
+                          Slack problems are logged and swallowed - they can
+                          never affect the onboarding result.
+
+    Steps run in this order (security agents first, BitLocker last):
+      1. Malwarebytes / ThreatDown Endpoint Agent
+      2. Splashtop Streamer (with deployment code applied)
+      3. Core apps: Google Chrome, Slack, Google Drive for Desktop
+      4. Purge Lenovo AI (AI Now / Qira)
+      5. Purge OneDrive (client only - never touches user files)
+      6. Knix Service Desk desktop shortcut
+      7. Corporate wallpaper
+      8. BitLocker (never reboots unless -AllowReboot is passed)
+
+.NOTES
+    Run as SYSTEM / Administrator. PowerShell 5.1.
+    Exit 0 = all steps OK or already compliant. Exit 1 = at least one step failed.
+
+    HOW TO RUN THIS - IT MATTERS
+    ----------------------------
+    This is a SCRIPT FILE. It has a param() block, so it must be executed as a
+    file, not fed line by line into an interactive PowerShell prompt.
+
+      RIGHT: Atera > Script Library > new script > UPLOAD this .ps1, then run
+             it against the device. Atera saves it to disk and runs it with
+             powershell.exe -File, which is correct.
+
+      RIGHT: powershell.exe -ExecutionPolicy Bypass -File .\Knix-Device-Onboarding.ps1
+
+      WRONG: pasting the text into Atera's "Run Command" console, or into an
+             interactive PS window. Those feed it line by line; param() is only
+             legal as the first statement of a file, so the whole thing fails
+             to parse and NOTHING runs - silently.
+
+    Confirm it parses before deploying:
+      $e=$null
+      [void][System.Management.Automation.Language.Parser]::ParseFile(
+          'C:\path\Knix-Device-Onboarding.ps1',[ref]$null,[ref]$e); $e
+
+    The first line of output is always "=== KNIX ONBOARDING STARTING ... ===".
+    No such line means the body never ran.
+#>
+
+[CmdletBinding()]
+param(
+
+# ############################################################################
+# #                                                                          #
+# #                  SLACK ALERTING - FILL THESE TWO IN                      #
+# #                                                                          #
+# #  1. Create a Slack app at https://api.slack.com/apps                     #
+# #  2. OAuth & Permissions -> Bot Token Scopes -> add  chat:write           #
+# #  3. Install to workspace, copy the Bot User OAuth Token (xoxb-...)       #
+# #  4. Invite the bot to the channel:  /invite @YourBotName                 #
+# #                                                                          #
+# #  Leave the token blank to disable Slack entirely - the script still      #
+# #  runs normally and just logs that alerting is off.                       #
+# #                                                                          #
+# #  Better: set these as Atera script PARAMETERS instead of hardcoding,     #
+# #  so the token never sits in the script body.                             #
+# #                                                                          #
+# ############################################################################
+
+    # Bot User OAuth Token, e.g. 'xoxb-1234567890-...'
+    [string]$SlackBotToken = '',
+
+    # Channel ID (preferred, e.g. 'C09ABCDEFGH') or name (e.g. '#it-alerts')
+    [string]$SlackChannel = '',
+
+    # Optional mention prepended to failure alerts only.
+    # Examples: '<!channel>'  '<!here>'  '<@U01ABCDEFGH>'  '<!subteam^S01ABC|@it-team>'
+    [string]$SlackMention = '',
+
+    # Always   = post every run, including a green "device ready" confirmation
+    #            once all post-install checks pass (default)
+    # Failures = post only when a step failed, a check failed, or a step was
+    #            skipped - silent on a clean device
+    # Never    = disable posting without clearing the token
+    [ValidateSet('Always','Failures','Never')]
+    [string]$SlackNotify = 'Always',
+
+    # Also post an immediate message the moment a step fails, instead of
+    # waiting for the end-of-run summary.
+    [switch]$SlackPerStep,
+
+# ############################################################################
+# #                        END SLACK CONFIGURATION                           #
+# ############################################################################
+
+    [string]$SplashtopDeployCode = 'TKXZT7R7SSSP',
+
+    [string]$SplashtopInstallerUrl = 'https://github.com/bengallagher-knix/splashtopdeployment/releases/download/splashtop-v1/Splashtop_Streamer_Windows_DEPLOY_INSTALLER_v3.8.6.0_TKXZT7R7SSSP.exe',
+
+    [string]$MalwarebytesToken = 'ed558c71-63f0-40c2-80c0-ee5ca74ec18e',
+
+    [string]$MalwarebytesGroupId = '43ebd935-dc34-4472-b192-7e0827985b61',
+
+    [string]$WallpaperUrl = 'https://raw.githubusercontent.com/bengallagher-knix/knix-pride-wallpaper/main/knixwallpaper.jpg',
+
+    [string]$ServiceDeskUrl = 'https://knixwear.atlassian.net/servicedesk/customer/portals',
+
+    # ------------------------------------------------------------------------
+    # DEBLOAT - what gets purged
+    #
+    # These patterns drive BOTH the Appx removal and the Win32 uninstall
+    # search, so keep them tight. Anything matched is logged before it is
+    # touched - run with -RemovalDryRun first on a new model to see the list.
+    # ------------------------------------------------------------------------
+    [string[]]$LenovoAiPatterns = @(
+        '*AINow*',
+        '*AI Now*',
+        '*Qira*',
+        '*LenovoAI*'
+    ),
+
+    # List matches and change nothing. Use this on the first device of a new
+    # model line before letting it purge.
+    [switch]$RemovalDryRun,
+
+    # Block OneDrive from coming back via policy (DisableFileSyncNGSC).
+    # On by default - without it Windows re-adds OneDrive for new profiles.
+    [bool]$BlockOneDriveReinstall = $true,
+
+    # Step names to skip, e.g. -Skip BitLocker,Wallpaper
+    [ValidateSet('Malwarebytes','Splashtop','CoreApps','RemoveLenovoAI','RemoveOneDrive','ServiceDesk','Wallpaper','BitLocker')]
+    [string[]]$Skip = @(),
+
+    # BitLocker needs a reboot to finish. OFF by default so the script never
+    # reboots a machine out from under the rest of the onboarding.
+    [switch]$AllowReboot
+)
+
+# First thing that runs. If you do not see this line in the output, the script
+# body never executed - it was a parse/invocation problem, not a logic problem.
+Write-Host "=== KNIX ONBOARDING STARTING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME ==="
+
+# Token handed over by the 64-bit relaunch below, so it never appears on a
+# command line.
+if ([string]::IsNullOrWhiteSpace($SlackBotToken) -and $env:KNIX_SLACK_TOKEN) {
+    $SlackBotToken = $env:KNIX_SLACK_TOKEN
+}
+
+# ============================================================================
+# GLOBAL BEHAVIOUR
+# ============================================================================
+# Continue, NOT Stop. A stray non-terminating error must never abort the run.
+# Individual calls that must succeed use -ErrorAction Stop inside a try/catch.
+$ErrorActionPreference = 'Continue'
+$ProgressPreference    = 'SilentlyContinue'   # huge speed-up for Invoke-WebRequest
+
+$Script:Root     = 'C:\ProgramData\Knix'
+$Script:LogDir   = Join-Path $Script:Root 'Logs'
+$Script:TempDir  = Join-Path $Script:Root 'Temp'
+$Script:StateDir = Join-Path $Script:Root 'State'
+$Script:LogFile  = Join-Path $Script:LogDir 'Onboarding.log'
+$Script:Results  = New-Object System.Collections.ArrayList
+$Script:RebootNeeded = $false
+
+foreach ($d in @($Script:Root, $Script:LogDir, $Script:TempDir, $Script:StateDir)) {
+    if (-not (Test-Path $d)) {
+        New-Item -Path $d -ItemType Directory -Force | Out-Null
+    }
+}
+
+# ============================================================================
+# 64-BIT GUARD
+# Atera can invoke 32-bit PowerShell. Under WOW64 the registry and Program Files
+# are redirected, which makes installs "succeed" but detection fail forever.
+# ============================================================================
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $ps64 = Join-Path $env:WINDIR 'SysNative\WindowsPowerShell\v1.0\powershell.exe'
+    if ((Test-Path $ps64) -and $PSCommandPath) {
+        $relaunch = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File', "`"$PSCommandPath`"")
+        foreach ($kvp in $PSBoundParameters.GetEnumerator()) {
+
+            # Never put the Slack token on a command line - it would be visible
+            # in the process list. Hand it over through the inherited environment.
+            if ($kvp.Key -eq 'SlackBotToken') {
+                $env:KNIX_SLACK_TOKEN = $kvp.Value
+                continue
+            }
+
+            if ($kvp.Value -is [switch]) {
+                if ($kvp.Value.IsPresent) { $relaunch += "-$($kvp.Key)" }
+            }
+            elseif ($kvp.Value -is [array]) {
+                $relaunch += "-$($kvp.Key)"
+                foreach ($v in $kvp.Value) { $relaunch += "$v" }
+            }
+            else {
+                $relaunch += "-$($kvp.Key)"
+                $relaunch += "`"$($kvp.Value)`""
+            }
+        }
+        Write-Host 'Relaunching in 64-bit PowerShell...'
+        & $ps64 $relaunch
+        exit $LASTEXITCODE
+    }
+}
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARN','ERROR','STEP')]
+        [string]$Level = 'INFO'
+    )
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Write-Host $line
+    try { Add-Content -Path $Script:LogFile -Value $line -ErrorAction Stop } catch { }
+}
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ----------------------------------------------------------------------------
+# SLACK
+# Alerting must never be able to break onboarding: every call is time-boxed,
+# fully wrapped, and failures are logged and swallowed.
+# ----------------------------------------------------------------------------
+
+function Test-SlackConfigured {
+    if ($SlackNotify -eq 'Never')            { return $false }
+    if ([string]::IsNullOrWhiteSpace($SlackBotToken)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($SlackChannel))  { return $false }
+    if ($SlackBotToken -notmatch '^xox[bp]-') {
+        Write-Log 'SlackBotToken does not look like a bot token (expected xoxb-...). Slack disabled.' 'WARN'
+        return $false
+    }
+    return $true
+}
+
+<#
+    Posts to Slack via chat.postMessage.
+    NOTE: Slack returns HTTP 200 even on failure, so the ok field is checked.
+    NOTE: never pass secrets (BitLocker recovery keys, tokens) into $Text.
+#>
+function Send-SlackMessage {
+    param(
+        [Parameter(Mandatory)][string]$Text,   # notification/fallback text
+        [array]$Blocks,                        # optional Block Kit payload
+        [int]$TimeoutSec = 20
+    )
+
+    if (-not (Test-SlackConfigured)) { return $false }
+
+    $payload = @{
+        channel = $SlackChannel
+        text    = $Text
+    }
+    if ($Blocks) { $payload['blocks'] = $Blocks }
+
+    try {
+        $body = $payload | ConvertTo-Json -Depth 10 -Compress
+
+        # Force UTF-8 so emoji and accented characters survive the trip.
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+
+        $response = Invoke-RestMethod -Uri 'https://slack.com/api/chat.postMessage' -Method Post -Headers @{ Authorization = "Bearer $SlackBotToken" } -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+
+        if ($response.ok) {
+            Write-Log "Slack alert posted to $SlackChannel."
+            return $true
+        }
+
+        # Common errors: invalid_auth, channel_not_found, not_in_channel,
+        # missing_scope (bot needs chat:write and must be invited to the channel).
+        Write-Log "Slack API rejected the message: $($response.error)" 'WARN'
+        return $false
+    }
+    catch {
+        Write-Log "Slack post failed: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Send-SlackStepFailure {
+    param(
+        [Parameter(Mandatory)][string]$StepName,
+        [string]$Detail
+    )
+
+    if (-not (Test-SlackConfigured)) { return }
+
+    $prefix = if ($SlackMention) { "$SlackMention " } else { '' }
+    $text   = "$prefix:x: Onboarding step *$StepName* failed on *$env:COMPUTERNAME*"
+
+    $blocks = @(
+        @{
+            type = 'section'
+            text = @{ type = 'mrkdwn'; text = $text }
+        },
+        @{
+            type   = 'section'
+            fields = @(
+                @{ type = 'mrkdwn'; text = "*Device*`n$env:COMPUTERNAME" },
+                @{ type = 'mrkdwn'; text = "*Step*`n$StepName" }
+            )
+        },
+        @{
+            type = 'section'
+            text = @{ type = 'mrkdwn'; text = "*Detail*`n``````$(Format-SlackText $Detail)``````" }
+        }
+    )
+
+    Send-SlackMessage -Text $text -Blocks $blocks | Out-Null
+}
+
+function Format-SlackText {
+    param([string]$Value, [int]$MaxLength = 700)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return 'n/a' }
+    $clean = $Value -replace '`', "'"          # backticks would break code fences
+    # Hard stop: a BitLocker recovery key must never reach Slack.
+    $clean = $clean -replace '\d{6}(-\d{6}){7}', '[REDACTED-RECOVERY-KEY]'
+    $clean = $clean -replace 'xox[baprs]-[A-Za-z0-9-]+', '[REDACTED-TOKEN]'
+    if ($clean.Length -gt $MaxLength) { $clean = $clean.Substring(0, $MaxLength) + ' ...[truncated]' }
+    return $clean
+}
+
+function Send-SlackSummary {
+    param(
+        [Parameter(Mandatory)][array]$Results,
+        [array]$Health = @(),
+        [bool]$RebootNeeded
+    )
+
+    if (-not (Test-SlackConfigured)) {
+        Write-Log 'Slack alerting is not configured - skipping notification.'
+        return
+    }
+
+    $failed    = @($Results | Where-Object { $_.Status -eq 'FAILED' })
+    $pending   = @($Results | Where-Object { $_.Status -in @('PENDING','SKIPPED') })
+    $unhealthy = @($Health  | Where-Object { $_.Healthy -eq $false })
+
+    $allGood = ($failed.Count -eq 0 -and $unhealthy.Count -eq 0)
+
+    if ($SlackNotify -eq 'Failures' -and $allGood -and $pending.Count -eq 0) {
+        Write-Log 'Clean run and SlackNotify=Failures - nothing posted to Slack.'
+        return
+    }
+
+    if ($failed.Count -gt 0 -or $unhealthy.Count -gt 0) {
+        $icon   = ':rotating_light:'
+        $header = "Device NOT ready: $env:COMPUTERNAME"
+    }
+    elseif ($pending.Count -gt 0) {
+        $icon   = ':warning:'
+        $header = "Device ready with warnings: $env:COMPUTERNAME"
+    }
+    else {
+        $icon   = ':white_check_mark:'
+        $header = "Device ready: $env:COMPUTERNAME"
+    }
+
+    $mention = if ($SlackMention -and $failed.Count -gt 0) { "$SlackMention " } else { '' }
+
+    # Fixed-width step table so it stays readable on mobile.
+    $table = ($Results | ForEach-Object {
+        '{0,-13} {1,-11} {2,6}s  {3}' -f $_.Step, $_.Status, $_.Seconds, (Format-SlackText $_.Detail 90)
+    }) -join "`n"
+
+    $os     = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    $serial = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+    $model  = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model
+
+    $blocks = @(
+        @{
+            type = 'header'
+            text = @{ type = 'plain_text'; text = "$icon $header"; emoji = $true }
+        },
+        @{
+            type   = 'section'
+            fields = @(
+                @{ type = 'mrkdwn'; text = "*Device*`n$env:COMPUTERNAME" },
+                @{ type = 'mrkdwn'; text = "*Model / Serial*`n$model / $serial" },
+                @{ type = 'mrkdwn'; text = "*OS*`n$os" },
+                @{ type = 'mrkdwn'; text = "*Reboot required*`n$RebootNeeded" }
+            )
+        }
+    )
+
+    if ($mention) {
+        $blocks += @{ type = 'section'; text = @{ type = 'mrkdwn'; text = $mention } }
+    }
+
+    if ($failed.Count -gt 0) {
+        $failDetail = ($failed | ForEach-Object { "- *$($_.Step)*: $(Format-SlackText $_.Detail 200)" }) -join "`n"
+        $blocks += @{
+            type = 'section'
+            text = @{ type = 'mrkdwn'; text = "*Failed steps*`n$failDetail" }
+        }
+    }
+
+    # Post-flight verification - this is the actual "is the device working"
+    # answer, read back from the machine rather than inferred from the steps.
+    if ($Health.Count -gt 0) {
+        $healthLines = ($Health | ForEach-Object {
+            $mark = switch ($_.Healthy) {
+                $true   { ':white_check_mark:' }
+                $false  { ':x:' }
+                default { ':heavy_minus_sign:' }
+            }
+            "$mark *$($_.Name)* - $(Format-SlackText $_.Detail 90)"
+        }) -join "`n"
+
+        $verdict = if ($allGood) {
+            ':tada: *All checks passed - this device is in full working condition.*'
+        } else {
+            ":x: *$($unhealthy.Count) check(s) failed - this device needs attention.*"
+        }
+
+        $blocks += @{
+            type = 'section'
+            text = @{ type = 'mrkdwn'; text = "*Post-install verification*`n$healthLines`n`n$verdict" }
+        }
+    }
+
+    $blocks += @{
+        type = 'section'
+        text = @{ type = 'mrkdwn'; text = "*Full result*`n``````$table``````" }
+    }
+
+    $blocks += @{
+        type     = 'context'
+        elements = @(
+            @{ type = 'mrkdwn'; text = "Log: ``$Script:LogFile``  |  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" }
+        )
+    }
+
+    # Fallback text is what shows in the notification and on unsupported clients.
+    $fallback = "$mention$icon $header"
+    if ($failed.Count -gt 0)    { $fallback += " - failed steps: $(($failed | ForEach-Object { $_.Step }) -join ', ')" }
+    if ($unhealthy.Count -gt 0) { $fallback += " - failed checks: $(($unhealthy | ForEach-Object { $_.Name }) -join ', ')" }
+    if ($allGood)               { $fallback += ' - all post-install checks passed' }
+
+    Send-SlackMessage -Text $fallback -Blocks $blocks | Out-Null
+}
+
+<#
+    Runs a native process with a HARD timeout. On timeout the whole process tree
+    is killed. This is the main defence against a hung installer taking the
+    onboarding down with it. Returns the exit code, or -1 if it had to be killed.
+#>
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSec = 600,
+        [string]$Label
+    )
+
+    if (-not $Label) { $Label = Split-Path $FilePath -Leaf }
+
+    $outFile = Join-Path $Script:LogDir ("proc_{0}_{1}.out.log" -f ($Label -replace '[^A-Za-z0-9_-]','_'), (Get-Date -Format 'HHmmss'))
+    $errFile = [IO.Path]::ChangeExtension($outFile, 'err.log')
+
+    Write-Log "Running: $FilePath $($Arguments -join ' ')  (timeout ${TimeoutSec}s)"
+
+    try {
+        $spArgs = @{
+            FilePath               = $FilePath
+            PassThru               = $true
+            NoNewWindow            = $true
+            RedirectStandardOutput = $outFile
+            RedirectStandardError  = $errFile
+            ErrorAction            = 'Stop'
+        }
+        if ($Arguments.Count -gt 0) { $spArgs['ArgumentList'] = $Arguments }
+
+        $proc = Start-Process @spArgs
+    }
+    catch {
+        Write-Log "Could not start $FilePath : $($_.Exception.Message)" 'ERROR'
+        return -2
+    }
+
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        Write-Log "$Label exceeded ${TimeoutSec}s - killing process tree (PID $($proc.Id))." 'ERROR'
+        try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+        return -1
+    }
+
+    $code = $proc.ExitCode
+
+    foreach ($f in @($outFile, $errFile)) {
+        if (Test-Path $f) {
+            $content = (Get-Content $f -Raw -ErrorAction SilentlyContinue)
+            if ($content -and $content.Trim()) {
+                $snippet = $content.Trim()
+                if ($snippet.Length -gt 1500) { $snippet = $snippet.Substring(0,1500) + ' ...[truncated]' }
+                Write-Log "$Label output: $snippet"
+            }
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Log "$Label exit code: $code"
+    return $code
+}
+
+<#
+    Download with retries, a timeout, a minimum-size sanity check (catches HTML
+    error pages), and a curl.exe fallback.
+#>
+function Invoke-Download {
+    param(
+        # Accepts several candidate sources. They are tried in order until one
+        # yields a file that passes the size check - vendors move these URLs.
+        [Parameter(Mandatory)][string[]]$Url,
+        [Parameter(Mandatory)][string]$Destination,
+        [int]$MinBytes = 100KB,
+        [int]$TimeoutSec = 300,
+        [int]$Retries = 2
+    )
+
+    $sourceNumber = 0
+
+    foreach ($candidate in $Url) {
+
+        $sourceNumber++
+        Write-Log "Source $sourceNumber of $($Url.Count): $candidate"
+
+        for ($attempt = 1; $attempt -le $Retries; $attempt++) {
+
+            Remove-Item $Destination -Force -ErrorAction SilentlyContinue
+
+            try {
+                Write-Log "  Invoke-WebRequest attempt $attempt of $Retries..."
+                Invoke-WebRequest -Uri $candidate -OutFile $Destination -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+            }
+            catch {
+                Write-Log "  Invoke-WebRequest failed: $($_.Exception.Message)" 'WARN'
+            }
+
+            if ((Test-Path $Destination) -and ((Get-Item $Destination).Length -ge $MinBytes)) {
+                $mb = [math]::Round((Get-Item $Destination).Length / 1MB, 2)
+                Write-Log "Downloaded $mb MB to $Destination" 'SUCCESS'
+                return $true
+            }
+
+            if (Test-Path $Destination) {
+                $got = (Get-Item $Destination).Length
+                Write-Log "  Got $got bytes, need at least $MinBytes - treating as a bad response." 'WARN'
+            }
+
+            # curl.exe ships in Windows 10 1803+ and copes with proxies,
+            # redirects and TLS quirks that Invoke-WebRequest trips over.
+            $curl = Join-Path $env:WINDIR 'System32\curl.exe'
+            if (Test-Path $curl) {
+                Remove-Item $Destination -Force -ErrorAction SilentlyContinue
+                $rc = Invoke-Native -FilePath $curl -Label 'curl' -TimeoutSec ($TimeoutSec + 30) -Arguments @(
+                    '-L','--fail','--silent','--show-error',
+                    '--max-time', "$TimeoutSec",
+                    '-o', $Destination,
+                    $candidate
+                )
+                if ($rc -eq 0 -and (Test-Path $Destination) -and ((Get-Item $Destination).Length -ge $MinBytes)) {
+                    $mb = [math]::Round((Get-Item $Destination).Length / 1MB, 2)
+                    Write-Log "Downloaded $mb MB via curl to $Destination" 'SUCCESS'
+                    return $true
+                }
+                Write-Log "  curl fallback did not produce a valid file (exit $rc)." 'WARN'
+            }
+
+            Start-Sleep -Seconds (5 * $attempt)
+        }
+
+        Write-Log "Source $sourceNumber exhausted - moving to the next one." 'WARN'
+    }
+
+    Remove-Item $Destination -Force -ErrorAction SilentlyContinue
+    Write-Log "Every download source failed. Tried: $($Url -join ' | ')" 'ERROR'
+    return $false
+}
+
+<#
+    Authenticode gate.
+
+    A brand-new image often cannot build a full trust chain yet (no root/CTL
+    updates fetched), which surfaces as UnknownError even for a perfectly good
+    Google or Slack installer - and that would silently block every install.
+    So: a bad signature is always fatal, but an unverifiable chain is tolerated
+    when the signer subject matches the publisher we expect.
+#>
+function Test-InstallerSignature {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedSubject
+    )
+
+    $name = Split-Path $Path -Leaf
+
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Could not read the signature of $name : $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+
+    if ($sig.Status -eq 'Valid') {
+        Write-Log "Signature valid: $subject"
+        if ($ExpectedSubject -and $subject -notlike "*$ExpectedSubject*") {
+            Write-Log "Signed, but by an unexpected publisher (expected *$ExpectedSubject*)." 'ERROR'
+            return $false
+        }
+        return $true
+    }
+
+    # Chain could not be evaluated - tolerated only with a matching publisher.
+    if ($sig.Status -eq 'UnknownError' -and $ExpectedSubject -and $subject -like "*$ExpectedSubject*") {
+        Write-Log "$name : chain could not be validated (status UnknownError) but it is signed by $subject - accepting." 'WARN'
+        Write-Log 'If this keeps happening, the image is missing root certificate updates.' 'WARN'
+        return $true
+    }
+
+    Write-Log "Signature check FAILED for $name : status=$($sig.Status) signer=$subject" 'ERROR'
+    return $false
+}
+
+function Get-InstalledApp {
+    param([Parameter(Mandatory)][string]$NameLike)
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($k in $keys) {
+        $hit = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue |
+               Where-Object { $_.DisplayName -like $NameLike } |
+               Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
+# ----------------------------------------------------------------------------
+# REMOVAL HELPERS
+# ----------------------------------------------------------------------------
+
+<#
+    Finds uninstall entries across BOTH machine hives and every loaded user
+    hive. Per-user installs (OneDrive is the classic one) live under HKU and
+    are invisible to a plain HKLM search.
+#>
+function Get-UninstallEntry {
+    param([Parameter(Mandatory)][string]$NameLike)
+
+    $roots = @(
+        @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*';            Scope = 'machine' },
+        @{ Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'; Scope = 'machine (x86)' }
+    )
+
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' } |
+        ForEach-Object {
+            $roots += @{
+                Path  = "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                Scope = "user $($_.PSChildName)"
+            }
+        }
+
+    $results = @()
+    foreach ($root in $roots) {
+        try {
+            $results += Get-ItemProperty -Path $root.Path -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like $NameLike } |
+                        ForEach-Object {
+                            [pscustomobject]@{
+                                DisplayName        = $_.DisplayName
+                                DisplayVersion     = $_.DisplayVersion
+                                UninstallString    = $_.UninstallString
+                                QuietUninstallString = $_.QuietUninstallString
+                                Scope              = $root.Scope
+                                KeyPath            = $_.PSPath
+                            }
+                        }
+        } catch { }
+    }
+    return $results
+}
+
+<#
+    Runs an uninstall entry as quietly as the vendor allows.
+    MSI products get a proper /X {code} /qn. Everything else gets its
+    QuietUninstallString, or its UninstallString plus a best-guess silent flag.
+#>
+function Invoke-UninstallEntry {
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [int]$TimeoutSec = 900
+    )
+
+    $name = $Entry.DisplayName
+    $cmd  = $Entry.QuietUninstallString
+    if (-not $cmd) { $cmd = $Entry.UninstallString }
+
+    if (-not $cmd) {
+        Write-Log "$name has no uninstall string - skipping." 'WARN'
+        return $false
+    }
+
+    # MSI: rebuild the command properly instead of trusting the stored string.
+    if ($cmd -match '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') {
+        $productCode = $Matches[0]
+        Write-Log "Uninstalling $name via MSI product code $productCode"
+        $code = Invoke-Native -FilePath 'msiexec.exe' -TimeoutSec $TimeoutSec -Label "uninstall-$name" -Arguments @('/X', $productCode, '/qn', '/norestart')
+        if ($code -in @(0,1605,1614,1641,3010)) {
+            if ($code -in @(1641,3010)) { $Script:RebootNeeded = $true }
+            Write-Log "$name removed (exit $code)." 'SUCCESS'
+            return $true
+        }
+        Write-Log "$name uninstall returned $code." 'WARN'
+        return $false
+    }
+
+    # EXE: add a silent switch if the vendor did not supply a quiet string.
+    if (-not $Entry.QuietUninstallString) {
+        if ($cmd -notmatch '(?i)(/s\b|/silent|/quiet|/qn|--silent)') {
+            $cmd = "$cmd /S"
+        }
+    }
+
+    Write-Log "Uninstalling $name via: $cmd"
+    $code = Invoke-Native -FilePath "$env:WINDIR\System32\cmd.exe" -TimeoutSec $TimeoutSec -Label "uninstall-$name" -Arguments @('/c', $cmd)
+
+    if ($code -in @(0,1605,1614,1641,3010)) {
+        if ($code -in @(1641,3010)) { $Script:RebootNeeded = $true }
+        Write-Log "$name removed (exit $code)." 'SUCCESS'
+        return $true
+    }
+
+    Write-Log "$name uninstall returned $code." 'WARN'
+    return $false
+}
+
+<#
+    Removes matching Appx/MSIX packages for every user and de-provisions them
+    from the image so new profiles do not get them back.
+#>
+function Remove-AppxByPattern {
+    param(
+        [Parameter(Mandatory)][string[]]$Patterns,
+        [switch]$DryRun
+    )
+
+    $removed = @()
+
+    foreach ($pattern in $Patterns) {
+
+        # Installed packages, all users.
+        try {
+            $pkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -like $pattern })
+            foreach ($pkg in $pkgs) {
+                if ($DryRun) {
+                    Write-Log "[DRY RUN] would remove Appx: $($pkg.Name) $($pkg.Version)" 'WARN'
+                    $removed += $pkg.Name
+                    continue
+                }
+                try {
+                    Write-Log "Removing Appx package $($pkg.Name) $($pkg.Version) for all users..."
+                    Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                    $removed += $pkg.Name
+                }
+                catch {
+                    Write-Log "Remove-AppxPackage failed for $($pkg.Name): $($_.Exception.Message)" 'WARN'
+                }
+            }
+        } catch { }
+
+        # Provisioned packages - stops it returning for new profiles.
+        try {
+            $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                      Where-Object { $_.DisplayName -like $pattern })
+            foreach ($p in $prov) {
+                if ($DryRun) {
+                    Write-Log "[DRY RUN] would de-provision: $($p.DisplayName) $($p.Version)" 'WARN'
+                    $removed += "$($p.DisplayName) (provisioned)"
+                    continue
+                }
+                try {
+                    Write-Log "De-provisioning $($p.DisplayName) $($p.Version)..."
+                    Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null
+                    $removed += "$($p.DisplayName) (provisioned)"
+                }
+                catch {
+                    Write-Log "De-provision failed for $($p.DisplayName): $($_.Exception.Message)" 'WARN'
+                }
+            }
+        } catch { }
+    }
+
+    return @($removed | Sort-Object -Unique)
+}
+
+function Stop-ProcessByName {
+    param([Parameter(Mandatory)][string[]]$Names, [switch]$DryRun)
+    $stopped = @()
+    foreach ($n in $Names) {
+        $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
+        foreach ($p in $procs) {
+            if ($DryRun) { Write-Log "[DRY RUN] would stop process $($p.Name) (PID $($p.Id))" 'WARN'; $stopped += $p.Name; continue }
+            try {
+                Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                Write-Log "Stopped process $($p.Name) (PID $($p.Id))."
+                $stopped += $p.Name
+            }
+            catch { Write-Log "Could not stop $($p.Name): $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    if ($stopped) { Start-Sleep -Seconds 3 }
+    return @($stopped | Sort-Object -Unique)
+}
+
+<#
+    Deletes a leftover directory - but ONLY if it is empty.
+    User data is never deleted by this script; a folder with anything in it is
+    reported for a human to look at instead.
+#>
+function Remove-EmptyDirectory {
+    param([Parameter(Mandatory)][string]$Path, [switch]$DryRun)
+
+    if (-not (Test-Path $Path)) { return $false }
+
+    $items = @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
+               Where-Object { -not $_.PSIsContainer })
+
+    if ($items.Count -gt 0) {
+        Write-Log "LEFT ALONE: $Path still contains $($items.Count) file(s) - not deleting user data." 'WARN'
+        return $false
+    }
+
+    if ($DryRun) { Write-Log "[DRY RUN] would remove empty folder $Path" 'WARN'; return $true }
+
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        Write-Log "Removed empty folder $Path"
+        return $true
+    }
+    catch {
+        Write-Log "Could not remove $Path : $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Invoke-MsiInstall {
+    param(
+        [Parameter(Mandatory)][string]$MsiPath,
+        [string[]]$Properties = @(),
+        [int]$TimeoutSec = 900,
+        [string]$Label = 'msi'
+    )
+    $msiLog  = Join-Path $Script:LogDir ("msi_{0}.log" -f ($Label -replace '[^A-Za-z0-9_-]','_'))
+    $msiArgs = @('/i', "`"$MsiPath`"") + $Properties + @('/qn','/norestart','/L*v', "`"$msiLog`"")
+    $code    = Invoke-Native -FilePath 'msiexec.exe' -Arguments $msiArgs -TimeoutSec $TimeoutSec -Label $Label
+
+    switch ($code) {
+        0     { Write-Log "$Label installed." 'SUCCESS'; return $true }
+        1641  { Write-Log "$Label installed; reboot initiated by installer." 'WARN'; $Script:RebootNeeded = $true; return $true }
+        3010  { Write-Log "$Label installed; reboot required." 'WARN'; $Script:RebootNeeded = $true; return $true }
+        1618  { Write-Log "$Label failed: another Windows Installer session is busy (1618)." 'ERROR'; return $false }
+        1603  { Write-Log "$Label failed: MSI fatal error 1603. See $msiLog" 'ERROR'; return $false }
+        -1    { Write-Log "$Label timed out and was killed." 'ERROR'; return $false }
+        default { Write-Log "$Label failed with exit code $code. See $msiLog" 'ERROR'; return $false }
+    }
+}
+
+<#
+    Waits for the Windows Installer mutex to free up so back-to-back MSI
+    installs do not fail with 1618.
+#>
+function Wait-ForMsiIdle {
+    param([int]$TimeoutSec = 300)
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+
+        $busy = $false
+        $mutex = $null
+        try {
+            # _MSIExecute exists only while an install is in progress.
+            $mutex = [System.Threading.Mutex]::OpenExisting('Global\_MSIExecute')
+            $busy = $true
+        }
+        catch [System.Threading.WaitHandleCannotBeOpenedException] { $busy = $false }
+        catch { $busy = $true }
+        finally { if ($mutex) { $mutex.Dispose() } }
+
+        if (-not $busy) { return $true }
+        Write-Log 'Another Windows Installer session is running - waiting...'
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Log 'Windows Installer still busy after wait; continuing anyway.' 'WARN'
+    return $false
+}
+
+function Test-PendingReboot {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+    $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+    return [bool]$pfro.PendingFileRenameOperations
+}
+
+<#
+    Post-flight verification.
+
+    Deliberately independent of the step results: it re-reads the machine's
+    actual state, so a step that reported success but did not really land is
+    still caught. This is what the "device ready" Slack confirmation is based on.
+
+    Healthy values: $true = good, $false = broken, 'SKIPPED' = not evaluated.
+#>
+function Get-DeviceHealth {
+
+    $checks = New-Object System.Collections.ArrayList
+
+    function Add-HealthCheck {
+        param([string]$Name, $Healthy, [string]$Detail)
+        [void]$checks.Add([pscustomobject]@{ Name = $Name; Healthy = $Healthy; Detail = $Detail })
+    }
+
+    # --- Malwarebytes -------------------------------------------------------
+    try {
+        if ($Skip -contains 'Malwarebytes') {
+            Add-HealthCheck 'Malwarebytes' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $svc = Get-Service -Name 'MBEndpointAgent' -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running')      { Add-HealthCheck 'Malwarebytes' $true  'agent service running' }
+            elseif ($svc)                                  { Add-HealthCheck 'Malwarebytes' $false "agent service is $($svc.Status)" }
+            elseif (Get-InstalledApp -NameLike '*Malwarebytes*Endpoint*') { Add-HealthCheck 'Malwarebytes' $false 'installed but no agent service' }
+            else                                           { Add-HealthCheck 'Malwarebytes' $false 'not installed' }
+        }
+    } catch { Add-HealthCheck 'Malwarebytes' $false "check error: $($_.Exception.Message)" }
+
+    # --- Splashtop ----------------------------------------------------------
+    try {
+        if ($Skip -contains 'Splashtop') {
+            Add-HealthCheck 'Splashtop' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $regPaths = @(
+                'HKLM:\SOFTWARE\WOW6432Node\Splashtop Inc.\Splashtop Remote Server',
+                'HKLM:\SOFTWARE\Splashtop Inc.\Splashtop Remote Server'
+            )
+            $present = $false
+            foreach ($p in $regPaths) { if (Test-Path $p) { $present = $true } }
+            foreach ($f in @('C:\Program Files (x86)\Splashtop\Splashtop Remote\Server',
+                             'C:\Program Files\Splashtop\Splashtop Remote\Server')) {
+                if (Test-Path $f) { $present = $true }
+            }
+
+            $enrolled = $false
+            foreach ($p in $regPaths) {
+                if (-not (Test-Path $p)) { continue }
+                $props = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
+                if (-not $props) { continue }
+                foreach ($prop in $props.PSObject.Properties) {
+                    if ($prop.Name -like 'PS*') { continue }
+                    if ("$($prop.Value)" -eq $SplashtopDeployCode) { $enrolled = $true }
+                }
+            }
+            $marker = Join-Path $Script:StateDir 'splashtop.dcode'
+            if (-not $enrolled -and (Test-Path $marker)) {
+                if ((Get-Content $marker -Raw -ErrorAction SilentlyContinue).Trim() -eq $SplashtopDeployCode) { $enrolled = $true }
+            }
+
+            $running = [bool](Get-Service -ErrorAction SilentlyContinue |
+                       Where-Object { $_.DisplayName -like '*Splashtop*' -and $_.Status -eq 'Running' })
+
+            if     (-not $present)  { Add-HealthCheck 'Splashtop' $false 'not installed' }
+            elseif (-not $enrolled) { Add-HealthCheck 'Splashtop' $false 'installed but deployment code not applied' }
+            elseif (-not $running)  { Add-HealthCheck 'Splashtop' $false 'enrolled but service not running' }
+            else                    { Add-HealthCheck 'Splashtop' $true  'installed, enrolled, service running' }
+        }
+    } catch { Add-HealthCheck 'Splashtop' $false "check error: $($_.Exception.Message)" }
+
+    # --- Core apps ----------------------------------------------------------
+    $appChecks = @(
+        @{ Name = 'Google Chrome'; Test = {
+               (Test-Path 'C:\Program Files\Google\Chrome\Application\chrome.exe') -or
+               (Test-Path 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') -or
+               [bool](Get-InstalledApp -NameLike 'Google Chrome') } },
+        @{ Name = 'Slack'; Test = {
+               [bool](Get-InstalledApp -NameLike '*Slack*') -or
+               (Test-Path 'C:\Program Files\Slack\slack.exe') } },
+        @{ Name = 'Google Drive'; Test = {
+               [bool](Get-ChildItem 'C:\Program Files\Google\Drive File Stream' -Filter 'GoogleDriveFS.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) } }
+    )
+
+    foreach ($a in $appChecks) {
+        try {
+            if ($Skip -contains 'CoreApps') { Add-HealthCheck $a.Name 'SKIPPED' 'skipped by parameter'; continue }
+            if (& $a.Test) { Add-HealthCheck $a.Name $true 'installed' }
+            else           { Add-HealthCheck $a.Name $false 'NOT installed' }
+        } catch { Add-HealthCheck $a.Name $false "check error: $($_.Exception.Message)" }
+    }
+
+    # --- Lenovo AI purged ---------------------------------------------------
+    # Inverted check: anything still present is a FAILURE.
+    try {
+        if ($Skip -contains 'RemoveLenovoAI') {
+            Add-HealthCheck 'Lenovo AI purged' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $names = @()
+            foreach ($pattern in $LenovoAiPatterns) {
+                $names += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -like $pattern } | ForEach-Object { $_.Name })
+                $names += @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DisplayName -like $pattern } | ForEach-Object { "$($_.DisplayName) (provisioned)" })
+                $w = Get-UninstallEntry -NameLike $pattern
+                if ($w) { $names += @($w | ForEach-Object { $_.DisplayName }) }
+            }
+            $names = @($names | Sort-Object -Unique)
+            if ($names.Count -gt 0) { Add-HealthCheck 'Lenovo AI purged' $false "still present: $($names -join ', ')" }
+            else                    { Add-HealthCheck 'Lenovo AI purged' $true  'no Lenovo AI components found' }
+        }
+    } catch { Add-HealthCheck 'Lenovo AI purged' $false "check error: $($_.Exception.Message)" }
+
+    # --- OneDrive purged ----------------------------------------------------
+    try {
+        if ($Skip -contains 'RemoveOneDrive') {
+            Add-HealthCheck 'OneDrive purged' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $odBits = @()
+            $odBits += @(Get-UninstallEntry -NameLike '*OneDrive*' | ForEach-Object { "$($_.DisplayName) [$($_.Scope)]" })
+            if (Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue) { $odBits += 'process running' }
+            $odBits += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -like '*OneDrive*' } | ForEach-Object { $_.Name })
+            $odBits = @($odBits | Sort-Object -Unique)
+
+            if ($odBits.Count -gt 0) { Add-HealthCheck 'OneDrive purged' $false "still present: $($odBits -join ', ')" }
+            else {
+                $blocked = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' -Name 'DisableFileSyncNGSC' -ErrorAction SilentlyContinue).DisableFileSyncNGSC
+                $note = if ($blocked -eq 1) { 'removed, reinstall blocked by policy' } else { 'removed' }
+                Add-HealthCheck 'OneDrive purged' $true $note
+            }
+        }
+    } catch { Add-HealthCheck 'OneDrive purged' $false "check error: $($_.Exception.Message)" }
+
+    # --- Service desk shortcut ---------------------------------------------
+    try {
+        if ($Skip -contains 'ServiceDesk') {
+            Add-HealthCheck 'Service Desk link' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $pub = Join-Path $env:PUBLIC 'Desktop\Knix Service Desk.url'
+            if (Test-Path $pub) { Add-HealthCheck 'Service Desk link' $true  'present on public desktop' }
+            else                { Add-HealthCheck 'Service Desk link' $false 'missing from public desktop' }
+        }
+    } catch { Add-HealthCheck 'Service Desk link' $false "check error: $($_.Exception.Message)" }
+
+    # --- Wallpaper ----------------------------------------------------------
+    try {
+        if ($Skip -contains 'Wallpaper') {
+            Add-HealthCheck 'Wallpaper' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $img = Join-Path $Script:Root 'Branding\wallpaper.jpg'
+            if (-not (Test-Path $img)) {
+                Add-HealthCheck 'Wallpaper' $false 'image not deployed'
+            }
+            else {
+                $hives = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+                           Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' })
+                if ($hives.Count -eq 0) {
+                    Add-HealthCheck 'Wallpaper' $true 'image staged; applies at first logon'
+                }
+                else {
+                    $applied = $hives | Where-Object {
+                        (Get-ItemProperty "Registry::HKEY_USERS\$($_.PSChildName)\Control Panel\Desktop" -Name Wallpaper -ErrorAction SilentlyContinue).Wallpaper -eq $img
+                    }
+                    if ($applied) { Add-HealthCheck 'Wallpaper' $true  "applied to $(@($applied).Count) of $($hives.Count) profile(s)" }
+                    else          { Add-HealthCheck 'Wallpaper' $false 'image present but not set on any profile' }
+                }
+            }
+        }
+    } catch { Add-HealthCheck 'Wallpaper' $false "check error: $($_.Exception.Message)" }
+
+    # --- BitLocker ----------------------------------------------------------
+    try {
+        if ($Skip -contains 'BitLocker') {
+            Add-HealthCheck 'BitLocker' 'SKIPPED' 'skipped by parameter'
+        }
+        elseif (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+            Add-HealthCheck 'BitLocker' 'SKIPPED' 'cmdlets unavailable on this edition'
+        }
+        else {
+            $v = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+            $hasKey = [bool]($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+
+            if ($v.ProtectionStatus -eq 'On' -and $v.VolumeStatus -eq 'FullyEncrypted' -and $hasKey) {
+                Add-HealthCheck 'BitLocker' $true 'fully encrypted, protection on, recovery key present'
+            }
+            elseif ($v.ProtectionStatus -eq 'On' -and $hasKey) {
+                Add-HealthCheck 'BitLocker' $true "encrypting ($($v.EncryptionPercentage)%), protection on"
+            }
+            elseif (-not $hasKey) {
+                Add-HealthCheck 'BitLocker' $false "no recovery password protector (status $($v.VolumeStatus))"
+            }
+            else {
+                Add-HealthCheck 'BitLocker' $false "protection $($v.ProtectionStatus), volume $($v.VolumeStatus)"
+            }
+        }
+    } catch { Add-HealthCheck 'BitLocker' $false "check error: $($_.Exception.Message)" }
+
+    return $checks
+}
+
+function Get-LoggedOnUser {
+    # quser.exe is avoided on purpose: under SYSTEM in session 0 it can block
+    # or return nothing. Owner of explorer.exe is reliable and fast.
+    $users = @()
+    try {
+        $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop
+        foreach ($p in $procs) {
+            try {
+                $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+                if ($owner.User) {
+                    $account = if ($owner.Domain) { "$($owner.Domain)\$($owner.User)" } else { $owner.User }
+                    if ($users -notcontains $account) { $users += $account }
+                }
+            } catch { }
+        }
+    }
+    catch {
+        Write-Log "Could not enumerate logged-on users: $($_.Exception.Message)" 'WARN'
+    }
+    return $users
+}
+
+function ConvertTo-Sid {
+    param([Parameter(Mandatory)][string]$Account)
+    try {
+        (New-Object System.Security.Principal.NTAccount($Account)).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch { $null }
+}
+
+function Set-RegValueIfDifferent {
+    <# Returns $true if it actually changed something (idempotency signal). #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [string]$Type = 'String'
+    )
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null }
+    $current = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+    if ($null -ne $current -and "$current" -eq "$Value") { return $false }
+    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+<#
+    The isolation wrapper. Nothing a step does - throw, exit-style error, native
+    failure - can escape this. Every step is recorded in the summary table.
+#>
+function Invoke-Step {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Body
+    )
+
+    if ($Skip -contains $Name) {
+        [void]$Script:Results.Add([pscustomobject]@{
+            Step = $Name; Status = 'SKIPPED'; Detail = 'Skipped by parameter'; Seconds = 0
+        })
+        Write-Log "=== $Name : skipped by parameter ===" 'WARN'
+        return
+    }
+
+    Write-Log "================ STEP: $Name ================" 'STEP'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $status = 'FAILED'
+    $detail = ''
+
+    try {
+        $result = & $Body
+        # A step body can emit stray output; the contract is that the LAST
+        # thing it returns is the status hashtable.
+        if ($result -is [System.Array] -and $result.Count -gt 0) { $result = $result[-1] }
+        if ($result -is [hashtable]) {
+            $status = $result.Status
+            $detail = $result.Detail
+        }
+        else {
+            $status = 'OK'
+            $detail = "$result"
+        }
+    }
+    catch {
+        $status = 'FAILED'
+        $detail = $_.Exception.Message
+        Write-Log "$Name threw: $($_.Exception.Message)" 'ERROR'
+        Write-Log "At: $($_.ScriptStackTrace)" 'ERROR'
+    }
+
+    $sw.Stop()
+    [void]$Script:Results.Add([pscustomobject]@{
+        Step    = $Name
+        Status  = $status
+        Detail  = $detail
+        Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    })
+    Write-Log "=== $Name finished: $status ($([math]::Round($sw.Elapsed.TotalSeconds,1))s) - $detail ===" $(if ($status -eq 'FAILED') { 'ERROR' } else { 'SUCCESS' })
+
+    # Immediate Slack alert, if asked for. Wrapped so a Slack outage cannot
+    # turn into an onboarding failure.
+    if ($status -eq 'FAILED' -and $SlackPerStep) {
+        try { Send-SlackStepFailure -StepName $Name -Detail $detail }
+        catch { Write-Log "Per-step Slack alert failed: $($_.Exception.Message)" 'WARN' }
+    }
+}
+
+# ============================================================================
+# PREFLIGHT
+# ============================================================================
+
+Write-Log '############################################################'
+Write-Log "Knix device onboarding started on $env:COMPUTERNAME"
+Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+Write-Log "PowerShell: $($PSVersionTable.PSVersion) | 64-bit process: $([Environment]::Is64BitProcess)"
+Write-Log "OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
+Write-Log '############################################################'
+
+if (Test-SlackConfigured) {
+    Write-Log "Slack alerting enabled (channel: $SlackChannel, mode: $SlackNotify)."
+}
+else {
+    Write-Log 'Slack alerting disabled (no token/channel set, or SlackNotify=Never).'
+}
+
+if (-not (Test-IsAdmin)) {
+    Write-Log 'Not running as Administrator/SYSTEM. Nothing can be done.' 'ERROR'
+    try {
+        Send-SlackMessage -Text ":rotating_light: $SlackMention Onboarding on *$env:COMPUTERNAME* aborted: not running as Administrator/SYSTEM." | Out-Null
+    } catch { }
+    exit 1
+}
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
+} catch { }
+
+# Old runs of the previous BitLocker script may have left a pending shutdown.
+# Cancel it so this run is not cut short.
+try { & shutdown.exe /a 2>&1 | Out-Null } catch { }
+
+# ============================================================================
+# STEP 1 - MALWAREBYTES / THREATDOWN ENDPOINT AGENT
+# Runs first so endpoint protection is never blocked by a later failure.
+# ============================================================================
+
+Invoke-Step -Name 'Malwarebytes' -Body {
+
+    $installed = Get-InstalledApp -NameLike '*Malwarebytes*Endpoint*'
+    $svc       = Get-Service -Name 'MBEndpointAgent' -ErrorAction SilentlyContinue
+
+    if ($installed -or $svc) {
+        Write-Log 'Malwarebytes Endpoint Agent already installed.'
+
+        if ($svc -and $svc.Status -ne 'Running') {
+            Write-Log 'MBEndpointAgent service is not running - starting it.' 'WARN'
+            try { Start-Service -Name 'MBEndpointAgent' -ErrorAction Stop }
+            catch { Write-Log "Could not start MBEndpointAgent: $($_.Exception.Message)" 'WARN' }
+        }
+
+        $eaCmd = 'C:\Program Files\Malwarebytes Endpoint Agent\UserAgent\EACmd.exe'
+        if (Test-Path $eaCmd) {
+            Invoke-Native -FilePath $eaCmd -Arguments @('-refreshagentinfo') -TimeoutSec 120 -Label 'EACmd-refresh' | Out-Null
+        }
+        return @{ Status = 'ALREADY OK'; Detail = 'Agent present; service checked' }
+    }
+
+    $msi = Join-Path $Script:TempDir 'ThreatDownEA.msi'
+    if (-not (Invoke-Download -Url 'https://ark.mwbsys.com/epa.win.installer.x64/release' -Destination $msi -MinBytes 1MB -TimeoutSec 600)) {
+        return @{ Status = 'FAILED'; Detail = 'Installer download failed' }
+    }
+
+    Wait-ForMsiIdle -TimeoutSec 180 | Out-Null
+
+    $ok = Invoke-MsiInstall -MsiPath $msi -Label 'malwarebytes' -TimeoutSec 1200 -Properties @(
+        "NEBULA_ACCOUNTTOKEN=$MalwarebytesToken",
+        "GROUP=$MalwarebytesGroupId"
+    )
+
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+    if (-not $ok) { return @{ Status = 'FAILED'; Detail = 'msiexec reported failure' } }
+
+    # Verify with retries - the service takes a moment to register.
+    $verified = $false
+    for ($i = 1; $i -le 10; $i++) {
+        Start-Sleep -Seconds 6
+        if (Get-Service -Name 'MBEndpointAgent' -ErrorAction SilentlyContinue) { $verified = $true; break }
+        if (Get-InstalledApp -NameLike '*Malwarebytes*Endpoint*')             { $verified = $true; break }
+        Write-Log "Malwarebytes verification attempt $i of 10..."
+    }
+
+    if (-not $verified) {
+        return @{ Status = 'FAILED'; Detail = 'Installed but agent not detected' }
+    }
+
+    $eaCmd = 'C:\Program Files\Malwarebytes Endpoint Agent\UserAgent\EACmd.exe'
+    if (Test-Path $eaCmd) {
+        Invoke-Native -FilePath $eaCmd -Arguments @('-refreshagentinfo')  -TimeoutSec 120 -Label 'EACmd-refresh' | Out-Null
+        Invoke-Native -FilePath $eaCmd -Arguments @('-updateprotection') -TimeoutSec 300 -Label 'EACmd-update'  | Out-Null
+    }
+
+    return @{ Status = 'INSTALLED'; Detail = 'Agent installed and enrolled to group' }
+}
+
+# ============================================================================
+# STEP 2 - SPLASHTOP STREAMER
+# Fix for "installs but then asks for the deployment code": the code has to be
+# passed to the installer as dcode=<code> inside the /i parameter string. The
+# old script relied on the code being embedded in the EXE and passed nothing.
+# ============================================================================
+
+Invoke-Step -Name 'Splashtop' -Body {
+
+    $regPaths = @(
+        'HKLM:\SOFTWARE\WOW6432Node\Splashtop Inc.\Splashtop Remote Server',
+        'HKLM:\SOFTWARE\Splashtop Inc.\Splashtop Remote Server'
+    )
+    $folders = @(
+        'C:\Program Files (x86)\Splashtop\Splashtop Remote\Server',
+        'C:\Program Files\Splashtop\Splashtop Remote\Server'
+    )
+    $markerFile = Join-Path $Script:StateDir 'splashtop.dcode'
+
+    function Test-SplashtopInstalled {
+        foreach ($p in $regPaths) { if (Test-Path $p) { return $true } }
+        foreach ($f in $folders)  { if (Test-Path $f) { return $true } }
+        return $false
+    }
+
+    function Test-SplashtopEnrolled {
+        # Primary signal: any value under the Splashtop key whose data matches
+        # the deployment code. Value names differ between Streamer versions, so
+        # match on the data rather than guessing a name.
+        foreach ($p in $regPaths) {
+            if (-not (Test-Path $p)) { continue }
+            $props = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($prop in $props.PSObject.Properties) {
+                if ($prop.Name -like 'PS*') { continue }
+                if ("$($prop.Value)" -eq $SplashtopDeployCode) {
+                    Write-Log "Deployment code found in registry value '$($prop.Name)'."
+                    return $true
+                }
+            }
+        }
+        # Secondary signal: our own marker from a previous successful run.
+        if (Test-Path $markerFile) {
+            $recorded = (Get-Content $markerFile -Raw -ErrorAction SilentlyContinue).Trim()
+            if ($recorded -eq $SplashtopDeployCode) {
+                Write-Log 'Deployment code previously applied (state marker present).'
+                return $true
+            }
+        }
+        return $false
+    }
+
+    $isInstalled = Test-SplashtopInstalled
+    $isEnrolled  = if ($isInstalled) { Test-SplashtopEnrolled } else { $false }
+
+    if ($isInstalled -and $isEnrolled) {
+        $svc = Get-Service -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like '*SplashtopRemote*' -or $_.DisplayName -like '*Splashtop*' }
+        foreach ($s in $svc) {
+            Write-Log "Splashtop service: $($s.DisplayName) [$($s.Status)]"
+            if ($s.Status -ne 'Running' -and $s.StartType -ne 'Disabled') {
+                try { Start-Service -Name $s.Name -ErrorAction Stop; Write-Log "Started $($s.Name)." }
+                catch { Write-Log "Could not start $($s.Name): $($_.Exception.Message)" 'WARN' }
+            }
+        }
+        return @{ Status = 'ALREADY OK'; Detail = 'Installed and enrolled with deployment code' }
+    }
+
+    if ($isInstalled -and -not $isEnrolled) {
+        Write-Log 'Splashtop is installed but not enrolled - re-running installer with dcode to enrol in place.' 'WARN'
+    }
+
+    $exe = Join-Path $Script:TempDir 'SplashtopStreamer.exe'
+    if (-not (Invoke-Download -Url $SplashtopInstallerUrl -Destination $exe -MinBytes 20MB -TimeoutSec 900)) {
+        return @{ Status = 'FAILED'; Detail = 'Installer download failed' }
+    }
+
+    if (-not (Test-InstallerSignature -Path $exe)) {
+        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        return @{ Status = 'FAILED'; Detail = 'Installer signature not valid - refused to run' }
+    }
+
+    # Splashtop Easy Deployment syntax. dcode= is what stops the Streamer from
+    # prompting for the deployment code after install.
+    # NOTE: no uninstall first. Re-running over an existing install applies the
+    # new deployment configuration and keeps the machine reachable throughout.
+    $argSets = @(
+        @('prevercheck','/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"),
+        @('/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1")   # redundancy
+    )
+
+    $installOk = $false
+    foreach ($set in $argSets) {
+        $code = Invoke-Native -FilePath $exe -Arguments $set -TimeoutSec 900 -Label 'splashtop'
+        if ($code -in @(0, 1641, 3010)) {
+            if ($code -in @(1641, 3010)) { $Script:RebootNeeded = $true }
+            $installOk = $true
+            break
+        }
+        Write-Log "Splashtop install attempt returned $code - trying the next argument set." 'WARN'
+        Start-Sleep -Seconds 10
+    }
+
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+
+    if (-not $installOk) {
+        return @{ Status = 'FAILED'; Detail = 'Installer did not return a success code' }
+    }
+
+    $verified = $false
+    for ($i = 1; $i -le 10; $i++) {
+        Start-Sleep -Seconds 5
+        if (Test-SplashtopInstalled) { $verified = $true; break }
+        Write-Log "Splashtop verification attempt $i of 10..."
+    }
+
+    if (-not $verified) {
+        return @{ Status = 'FAILED'; Detail = 'Installer succeeded but Streamer not detected' }
+    }
+
+    Set-Content -Path $markerFile -Value $SplashtopDeployCode -Encoding ASCII -Force -ErrorAction SilentlyContinue
+
+    $enrolled = Test-SplashtopEnrolled
+    $svcFound = Get-Service -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*Splashtop*' }
+    foreach ($s in $svcFound) { Write-Log "Splashtop service: $($s.DisplayName) [$($s.Status)]" }
+
+    if (-not $svcFound) { Write-Log 'No Splashtop service found after install.' 'WARN' }
+
+    return @{
+        Status = 'INSTALLED'
+        Detail = "Streamer installed with dcode=$SplashtopDeployCode (enrolment confirmed: $enrolled)"
+    }
+}
+
+# ============================================================================
+# STEP 3 - CORE APPS
+# Chocolatey is gone. It needed a bootstrap download, a shell restart for PATH,
+# and its Slack package installs per-user, so it could never verify under
+# SYSTEM. Vendor enterprise installers are machine-wide and silent by design.
+# ============================================================================
+
+Invoke-Step -Name 'CoreApps' -Body {
+
+    $apps = @(
+        [pscustomobject]@{
+            Name      = 'Google Chrome'
+            # Google serves the Enterprise MSI from several paths and rotates
+            # which one the download page points at. All three are tried.
+            Urls      = @(
+                'https://dl.google.com/edgedl/chrome/install/GoogleChromeStandaloneEnterprise64.msi',
+                'https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi',
+                'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
+            )
+            File      = 'chrome_enterprise.msi'
+            Kind      = 'msi'
+            MinBytes  = 40MB
+            Publisher = 'Google LLC'
+            Args      = @()
+            Detect    = {
+                (Test-Path 'C:\Program Files\Google\Chrome\Application\chrome.exe') -or
+                (Test-Path 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') -or
+                [bool](Get-InstalledApp -NameLike 'Google Chrome')
+            }
+        },
+        [pscustomobject]@{
+            Name      = 'Slack'
+            Urls      = @(
+                'https://slack.com/ssb/download-win64-msi',
+                'https://downloads.slack-edge.com/desktop-releases/windows/x64/slack-standalone-latest.msi'
+            )
+            File      = 'slack_machine_wide.msi'
+            Kind      = 'msi'
+            MinBytes  = 20MB
+            Publisher = 'Slack Technologies'
+            Args      = @()
+            Detect    = {
+                [bool](Get-InstalledApp -NameLike '*Slack*') -or
+                (Test-Path 'C:\Program Files\Slack\slack.exe')
+            }
+        },
+        [pscustomobject]@{
+            Name      = 'Google Drive for Desktop'
+            Urls      = @(
+                'https://dl.google.com/drive-file-stream/GoogleDriveSetup.exe'
+            )
+            File      = 'GoogleDriveSetup.exe'
+            Kind      = 'exe'
+            MinBytes  = 15MB
+            Publisher = 'Google LLC'
+            Args      = @('--silent','--gsuite_shortcuts=false')
+            Detect    = {
+                (Test-Path 'C:\Program Files\Google\Drive File Stream') -and
+                [bool](Get-ChildItem 'C:\Program Files\Google\Drive File Stream' -Filter 'GoogleDriveFS.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+            }
+        }
+    )
+
+    $installed = @()
+    $already   = @()
+    $failed    = @()
+
+    foreach ($app in $apps) {
+
+        # --- idempotency check -------------------------------------------------
+        if (& $app.Detect) {
+            Write-Log "$($app.Name) already present - nothing to do."
+            $already += $app.Name
+            continue
+        }
+
+        Write-Log "$($app.Name) not present - installing."
+
+        $path = Join-Path $Script:TempDir $app.File
+
+        if (-not (Invoke-Download -Url $app.Urls -Destination $path -MinBytes $app.MinBytes -TimeoutSec 900)) {
+            Write-Log "$($app.Name): all download sources failed." 'ERROR'
+            $failed += "$($app.Name) (download)"
+            continue
+        }
+
+        if (-not (Test-InstallerSignature -Path $path -ExpectedSubject $app.Publisher)) {
+            Write-Log "$($app.Name): refusing to run an installer that failed signature validation." 'ERROR'
+            Remove-Item $path -Force -ErrorAction SilentlyContinue
+            $failed += "$($app.Name) (signature)"
+            continue
+        }
+
+        $ok = $false
+        if ($app.Kind -eq 'msi') {
+            Wait-ForMsiIdle -TimeoutSec 180 | Out-Null
+            $ok = Invoke-MsiInstall -MsiPath $path -Label ($app.Name -replace '\s','') -TimeoutSec 1200
+        }
+        else {
+            $code = Invoke-Native -FilePath $path -Arguments $app.Args -TimeoutSec 1200 -Label ($app.Name -replace '\s','')
+            if ($code -in @(0, 1641, 3010)) {
+                if ($code -in @(1641, 3010)) { $Script:RebootNeeded = $true }
+                $ok = $true
+            }
+        }
+
+        Remove-Item $path -Force -ErrorAction SilentlyContinue
+
+        if (-not $ok) {
+            $failed += "$($app.Name) (installer)"
+            continue
+        }
+
+        # --- verify (installers can report success and still not land) ---------
+        $verified = $false
+        for ($i = 1; $i -le 6; $i++) {
+            Start-Sleep -Seconds 5
+            if (& $app.Detect) { $verified = $true; break }
+            Write-Log "$($app.Name) verification attempt $i of 6..."
+        }
+
+        if ($verified) {
+            Write-Log "$($app.Name) installed and verified." 'SUCCESS'
+            $installed += $app.Name
+        }
+        else {
+            Write-Log "$($app.Name) installer succeeded but the app was not detected." 'ERROR'
+            $failed += "$($app.Name) (verify)"
+        }
+    }
+
+    $detailParts = @()
+    if ($installed) { $detailParts += "installed: $($installed -join ', ')" }
+    if ($already)   { $detailParts += "already ok: $($already -join ', ')" }
+    if ($failed)    { $detailParts += "FAILED: $($failed -join ', ')" }
+    $detail = $detailParts -join ' | '
+
+    if ($failed.Count -gt 0) { return @{ Status = 'FAILED';     Detail = $detail } }
+    if ($installed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = $detail } }
+    return @{ Status = 'INSTALLED'; Detail = $detail }
+}
+
+# ============================================================================
+# STEP 4 - PURGE LENOVO AI (AI Now / Qira)
+#
+# Removes every trace: Appx packages for all users, the provisioned copy on the
+# image (so new profiles do not get it back), Win32 uninstall entries, services,
+# running processes and scheduled tasks.
+#
+# Scope is controlled by -LenovoAiPatterns. Run once with -RemovalDryRun on a
+# new model line to see exactly what matches before letting it delete anything.
+# ============================================================================
+
+Invoke-Step -Name 'RemoveLenovoAI' -Body {
+
+    $patterns = $LenovoAiPatterns
+    Write-Log "Match patterns: $($patterns -join ', ')"
+    if ($RemovalDryRun) { Write-Log 'DRY RUN - nothing will actually be removed.' 'WARN' }
+
+    $removed = @()
+
+    # --- 1. Stop processes so files are not locked --------------------------
+    $procNames = @()
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        foreach ($pattern in $patterns) {
+            if ($p.Name -like $pattern -or $p.Description -like $pattern) { $procNames += $p.Name }
+        }
+    }
+    $procNames = @($procNames | Sort-Object -Unique)
+    if ($procNames) {
+        $stopped = Stop-ProcessByName -Names $procNames -DryRun:$RemovalDryRun
+        if ($stopped) { $removed += "stopped: $($stopped -join ', ')" }
+    }
+
+    # --- 2. Stop and delete services ----------------------------------------
+    foreach ($pattern in $patterns) {
+        $svcs = @(Get-Service -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like $pattern -or $_.DisplayName -like $pattern })
+        foreach ($svc in $svcs) {
+            if ($RemovalDryRun) {
+                Write-Log "[DRY RUN] would stop and delete service $($svc.Name) ($($svc.DisplayName))" 'WARN'
+                $removed += "service $($svc.Name)"
+                continue
+            }
+            try {
+                if ($svc.Status -ne 'Stopped') {
+                    Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+                    Write-Log "Stopped service $($svc.Name)."
+                }
+                $rc = Invoke-Native -FilePath 'sc.exe' -Arguments @('delete', $svc.Name) -TimeoutSec 60 -Label "sc-delete-$($svc.Name)"
+                if ($rc -eq 0) {
+                    Write-Log "Deleted service $($svc.Name)." 'SUCCESS'
+                    $removed += "service $($svc.Name)"
+                }
+            }
+            catch { Write-Log "Service removal failed for $($svc.Name): $($_.Exception.Message)" 'WARN' }
+        }
+    }
+
+    # --- 3. Appx packages + provisioning ------------------------------------
+    $appxRemoved = Remove-AppxByPattern -Patterns $patterns -DryRun:$RemovalDryRun
+    if ($appxRemoved) { $removed += $appxRemoved }
+
+    # --- 4. Win32 uninstall entries -----------------------------------------
+    foreach ($pattern in $patterns) {
+        $entries = @(Get-UninstallEntry -NameLike $pattern)
+        foreach ($entry in $entries) {
+            Write-Log "Found Win32 entry: $($entry.DisplayName) $($entry.DisplayVersion) [$($entry.Scope)]"
+            if ($RemovalDryRun) {
+                $cmdPreview = $entry.QuietUninstallString
+                if (-not $cmdPreview) { $cmdPreview = $entry.UninstallString }
+                Write-Log "[DRY RUN] would run: $cmdPreview" 'WARN'
+                $removed += $entry.DisplayName
+                continue
+            }
+            if (Invoke-UninstallEntry -Entry $entry) { $removed += $entry.DisplayName }
+        }
+    }
+
+    # --- 5. Scheduled tasks --------------------------------------------------
+    foreach ($pattern in $patterns) {
+        $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+                   Where-Object { $_.TaskName -like $pattern -or $_.TaskPath -like "*Lenovo*" -and $_.TaskName -like $pattern })
+        foreach ($t in $tasks) {
+            if ($RemovalDryRun) { Write-Log "[DRY RUN] would remove task $($t.TaskPath)$($t.TaskName)" 'WARN'; continue }
+            try {
+                Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+                Write-Log "Removed scheduled task $($t.TaskPath)$($t.TaskName)." 'SUCCESS'
+                $removed += "task $($t.TaskName)"
+            }
+            catch { Write-Log "Could not remove task $($t.TaskName): $($_.Exception.Message)" 'WARN' }
+        }
+    }
+
+    # --- 6. Verify -----------------------------------------------------------
+    if ($RemovalDryRun) {
+        if ($removed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'Dry run: nothing matched' } }
+        return @{ Status = 'CHANGED'; Detail = "Dry run: would remove $($removed.Count) item(s) - $(($removed | Select-Object -First 6) -join ', ')" }
+    }
+
+    Start-Sleep -Seconds 3
+
+    $leftovers = @()
+    foreach ($pattern in $patterns) {
+        $leftovers += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -like $pattern } | ForEach-Object { $_.Name })
+        $leftovers += @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like $pattern } | ForEach-Object { "$($_.DisplayName) (provisioned)" })
+        $w = Get-UninstallEntry -NameLike $pattern
+        if ($w) { $leftovers += @($w | ForEach-Object { $_.DisplayName }) }
+    }
+    $leftovers = @($leftovers | Sort-Object -Unique)
+
+    if ($leftovers.Count -gt 0) {
+        return @{ Status = 'FAILED'; Detail = "Still present after removal: $($leftovers -join ', ')" }
+    }
+
+    if ($removed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'No Lenovo AI components present' } }
+    return @{ Status = 'CHANGED'; Detail = "Purged: $(($removed | Select-Object -First 8) -join ', ')" }
+}
+
+# ============================================================================
+# STEP 5 - PURGE ONEDRIVE
+#
+# IMPORTANT - USER DATA:
+#   This uninstalls the OneDrive CLIENT. It never deletes the contents of a
+#   user's OneDrive folder. Leftover folders are removed only when completely
+#   empty; anything still holding files is logged for a human to review.
+#
+#   Before running this fleet-wide, be sure nobody has files that exist ONLY
+#   in OneDrive. With Files On-Demand, a cloud-only file that was never
+#   downloaded is not in the local folder - uninstalling the client makes it
+#   unreachable from that PC (it stays in the user's cloud account).
+# ============================================================================
+
+Invoke-Step -Name 'RemoveOneDrive' -Body {
+
+    if ($RemovalDryRun) { Write-Log 'DRY RUN - nothing will actually be removed.' 'WARN' }
+
+    $removed = @()
+
+    # --- 1. Stop the client --------------------------------------------------
+    $stopped = Stop-ProcessByName -Names @('OneDrive','OneDriveSetup','FileCoAuth','FileSyncHelper') -DryRun:$RemovalDryRun
+    if ($stopped) { $removed += "stopped: $($stopped -join ', ')" }
+
+    # --- 2. Run every OneDriveSetup uninstaller we can find ------------------
+    # Machine copies plus one per user profile - OneDrive installs per-user, so
+    # a single uninstall call is never enough on a multi-profile machine.
+    $setupPaths = @(
+        (Join-Path $env:WINDIR 'SysWOW64\OneDriveSetup.exe'),
+        (Join-Path $env:WINDIR 'System32\OneDriveSetup.exe')
+    )
+
+    $profileRoot = Split-Path $env:PUBLIC -Parent
+    if (-not (Test-Path $profileRoot)) { $profileRoot = 'C:\Users' }
+
+    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('Public','All Users') } |
+        ForEach-Object {
+            $base = Join-Path $_.FullName 'AppData\Local\Microsoft\OneDrive'
+            if (-not (Test-Path $base)) { return }
+
+            $direct = Join-Path $base 'OneDriveSetup.exe'
+            if (Test-Path $direct) { $setupPaths += $direct }
+
+            # Versioned subfolders: ...\OneDrive\24.201.1006.0005\OneDriveSetup.exe
+            Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $versioned = Join-Path $_.FullName 'OneDriveSetup.exe'
+                    if (Test-Path $versioned) { $setupPaths += $versioned }
+                }
+        }
+
+    $setupPaths = @($setupPaths | Sort-Object -Unique | Where-Object { Test-Path $_ })
+
+    foreach ($setup in $setupPaths) {
+        if ($RemovalDryRun) { Write-Log "[DRY RUN] would run: $setup /uninstall" 'WARN'; $removed += $setup; continue }
+        $rc = Invoke-Native -FilePath $setup -Arguments @('/uninstall') -TimeoutSec 300 -Label 'onedrive-uninstall'
+        Write-Log "$setup /uninstall returned $rc"
+        $removed += 'ran OneDriveSetup /uninstall'
+    }
+
+    # --- 3. Registry uninstall entries (per-user installs live under HKU) ----
+    foreach ($entry in @(Get-UninstallEntry -NameLike '*OneDrive*')) {
+        Write-Log "Found uninstall entry: $($entry.DisplayName) [$($entry.Scope)]"
+        if ($RemovalDryRun) { Write-Log '[DRY RUN] would run its uninstall string' 'WARN'; continue }
+        if (Invoke-UninstallEntry -Entry $entry) { $removed += $entry.DisplayName }
+    }
+
+    # --- 4. Appx/MSIX variants ----------------------------------------------
+    $appxRemoved = Remove-AppxByPattern -Patterns @('*OneDrive*') -DryRun:$RemovalDryRun
+    if ($appxRemoved) { $removed += $appxRemoved }
+
+    # --- 5. Scheduled tasks --------------------------------------------------
+    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like '*OneDrive*' })) {
+        if ($RemovalDryRun) { Write-Log "[DRY RUN] would remove task $($t.TaskName)" 'WARN'; continue }
+        try {
+            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+            Write-Log "Removed scheduled task $($t.TaskName)." 'SUCCESS'
+            $removed += "task $($t.TaskName)"
+        }
+        catch { Write-Log "Could not remove task $($t.TaskName): $($_.Exception.Message)" 'WARN' }
+    }
+
+    # --- 6. Explorer sidebar entry + per-user autostart ----------------------
+    $nsKeys = @(
+        'HKLM:\SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+        'HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
+    )
+    foreach ($k in $nsKeys) {
+        if (-not (Test-Path $k)) { continue }
+        if ($RemovalDryRun) { Write-Log "[DRY RUN] would hide Explorer namespace entry at $k" 'WARN'; continue }
+        if (Set-RegValueIfDifferent -Path $k -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -Type 'DWord') {
+            Write-Log 'Removed OneDrive from the Explorer sidebar.'
+            $removed += 'explorer sidebar entry'
+        }
+    }
+
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' } |
+        ForEach-Object {
+            $runKey = "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Run"
+            if (-not (Test-Path $runKey)) { return }
+            foreach ($valueName in @('OneDrive','OneDriveSetup')) {
+                if ($null -eq (Get-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue)) { continue }
+                if ($RemovalDryRun) { Write-Log "[DRY RUN] would remove autostart $valueName for $($_.PSChildName)" 'WARN'; continue }
+                Remove-ItemProperty -Path $runKey -Name $valueName -Force -ErrorAction SilentlyContinue
+                Write-Log "Removed autostart entry $valueName for SID $($_.PSChildName)."
+                $removed += "autostart $valueName"
+            }
+        }
+
+    # --- 7. Stop it coming back for new profiles ----------------------------
+    $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+    if ((Test-Path $defaultHive) -and -not $RemovalDryRun) {
+        $rc = Invoke-Native -FilePath 'reg.exe' -TimeoutSec 60 -Label 'reg-load-od' -Arguments @('load','HKU\KnixDefaultOD', $defaultHive)
+        if ($rc -eq 0) {
+            try {
+                $runKey = 'Registry::HKEY_USERS\KnixDefaultOD\Software\Microsoft\Windows\CurrentVersion\Run'
+                if (Test-Path $runKey) {
+                    foreach ($valueName in @('OneDrive','OneDriveSetup')) {
+                        if ($null -ne (Get-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue)) {
+                            Remove-ItemProperty -Path $runKey -Name $valueName -Force -ErrorAction SilentlyContinue
+                            Write-Log "Removed $valueName autostart from the default profile."
+                            $removed += 'default profile autostart'
+                        }
+                    }
+                }
+            }
+            finally {
+                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                Start-Sleep -Seconds 2
+                Invoke-Native -FilePath 'reg.exe' -Arguments @('unload','HKU\KnixDefaultOD') -TimeoutSec 60 -Label 'reg-unload-od' | Out-Null
+            }
+        }
+        else { Write-Log 'Could not load the default user hive - skipping that cleanup.' 'WARN' }
+    }
+
+    if ($BlockOneDriveReinstall -and -not $RemovalDryRun) {
+        $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
+        if (Set-RegValueIfDifferent -Path $policyKey -Name 'DisableFileSyncNGSC' -Value 1 -Type 'DWord') {
+            Write-Log 'Policy set: OneDrive file sync disabled (DisableFileSyncNGSC=1).' 'SUCCESS'
+            $removed += 'reinstall blocked by policy'
+        }
+    }
+
+    # --- 8. Leftover folders - EMPTY ONES ONLY ------------------------------
+    $candidateFolders = @(
+        (Join-Path $env:ProgramFiles 'Microsoft OneDrive'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft OneDrive'),
+        (Join-Path $env:ProgramData 'Microsoft OneDrive')
+    )
+
+    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('Public','All Users') } |
+        ForEach-Object {
+            $candidateFolders += (Join-Path $_.FullName 'AppData\Local\Microsoft\OneDrive')
+        }
+
+    foreach ($folder in ($candidateFolders | Where-Object { $_ } | Sort-Object -Unique)) {
+        if (Remove-EmptyDirectory -Path $folder -DryRun:$RemovalDryRun) { $removed += "folder $folder" }
+    }
+
+    # User OneDrive data folders are only reported, never touched.
+    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('Public','All Users') } |
+        ForEach-Object {
+            Get-ChildItem -Path $_.FullName -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $count = @(Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
+                    if ($count -gt 0) {
+                        Write-Log "REVIEW: $($_.FullName) still holds $count file(s). Left untouched." 'WARN'
+                    }
+                    else {
+                        Remove-EmptyDirectory -Path $_.FullName -DryRun:$RemovalDryRun | Out-Null
+                    }
+                }
+        }
+
+    # --- 9. Verify -----------------------------------------------------------
+    if ($RemovalDryRun) {
+        return @{ Status = 'CHANGED'; Detail = "Dry run: $($removed.Count) action(s) would run" }
+    }
+
+    Start-Sleep -Seconds 3
+
+    $stillRunning = @(Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue)
+    $stillInstalled = @(Get-UninstallEntry -NameLike '*OneDrive*')
+
+    if ($stillRunning.Count -gt 0 -or $stillInstalled.Count -gt 0) {
+        $what = @()
+        if ($stillRunning.Count -gt 0)   { $what += 'process still running' }
+        if ($stillInstalled.Count -gt 0) { $what += "uninstall entries remain: $(($stillInstalled | ForEach-Object { "$($_.DisplayName) [$($_.Scope)]" }) -join ', ')" }
+        return @{ Status = 'FAILED'; Detail = ($what -join '; ') }
+    }
+
+    if ($removed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'OneDrive not present' } }
+    return @{ Status = 'CHANGED'; Detail = "Removed: $(($removed | Select-Object -Unique | Select-Object -First 8) -join ', ')" }
+}
+
+# ============================================================================
+# STEP 6 - KNIX SERVICE DESK SHORTCUT
+# Get-LocalUser is gone - it needs the LocalAccounts module and throws on some
+# builds. Profile folders are enumerated directly instead.
+# ============================================================================
+
+Invoke-Step -Name 'ServiceDesk' -Body {
+
+    $newName = 'Knix Service Desk.url'
+    $oldNames = @('IT Help Desk.url','IT Help Desk.lnk','Knix Service Desk.lnk')
+
+    $content = @"
+[InternetShortcut]
+URL=$ServiceDeskUrl
+IconFile=C:\Windows\System32\shell32.dll
+IconIndex=160
+"@
+
+    $changed = @()
+
+    # --- 1. Public desktop is the source of truth ---------------------------
+    $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
+    if (-not (Test-Path $publicDesktop)) { $publicDesktop = 'C:\Users\Public\Desktop' }
+
+    if (Test-Path $publicDesktop) {
+        $target = Join-Path $publicDesktop $newName
+        $needWrite = $true
+        if (Test-Path $target) {
+            $existing = (Get-Content $target -Raw -ErrorAction SilentlyContinue)
+            if ($existing -and ($existing -replace '\s','') -eq ($content -replace '\s','')) {
+                $needWrite = $false
+                Write-Log 'Public desktop shortcut already correct.'
+            }
+        }
+        if ($needWrite) {
+            $content | Out-File -FilePath $target -Encoding ASCII -Force
+            Write-Log "Wrote $target" 'SUCCESS'
+            $changed += 'public desktop shortcut'
+        }
+    }
+    else {
+        Write-Log "Public desktop not found at $publicDesktop" 'WARN'
+    }
+
+    # --- 2. Remove stale copies everywhere ----------------------------------
+    $desktops = @()
+    if (Test-Path $publicDesktop) { $desktops += $publicDesktop }
+
+    $profileRoot = Split-Path $env:PUBLIC -Parent
+    if (-not (Test-Path $profileRoot)) { $profileRoot = 'C:\Users' }
+
+    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('Public','Default','Default User','All Users') } |
+        ForEach-Object {
+            $d = Join-Path $_.FullName 'Desktop'
+            if (Test-Path $d) { $desktops += $d }
+        }
+
+    foreach ($d in $desktops) {
+        foreach ($old in $oldNames) {
+            $p = Join-Path $d $old
+            if (Test-Path $p) {
+                Remove-Item $p -Force -ErrorAction SilentlyContinue
+                Write-Log "Removed stale shortcut: $p"
+                $changed += "removed $old"
+            }
+        }
+        # A per-user copy of the current shortcut is a duplicate of the public one.
+        if ($d -ne $publicDesktop) {
+            $dupe = Join-Path $d $newName
+            if (Test-Path $dupe) {
+                Remove-Item $dupe -Force -ErrorAction SilentlyContinue
+                Write-Log "Removed duplicate per-user shortcut: $dupe"
+                $changed += 'removed per-user duplicate'
+            }
+        }
+    }
+
+    if ($changed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'Shortcut already correct' } }
+    return @{ Status = 'CHANGED'; Detail = ($changed | Select-Object -Unique) -join ', ' }
+}
+
+# ============================================================================
+# STEP 7 - CORPORATE WALLPAPER
+# ============================================================================
+
+Invoke-Step -Name 'Wallpaper' -Body {
+
+    $brandDir  = Join-Path $Script:Root 'Branding'
+    $imagePath = Join-Path $brandDir 'wallpaper.jpg'
+    $tempImage = Join-Path $Script:TempDir 'wallpaper_new.jpg'
+
+    if (-not (Test-Path $brandDir)) { New-Item -Path $brandDir -ItemType Directory -Force | Out-Null }
+
+    $changed = @()
+
+    # --- 1. Fetch only if different ----------------------------------------
+    if (-not (Invoke-Download -Url $WallpaperUrl -Destination $tempImage -MinBytes 10KB -TimeoutSec 300)) {
+        if (-not (Test-Path $imagePath)) {
+            return @{ Status = 'FAILED'; Detail = 'Wallpaper download failed and no local copy exists' }
+        }
+        Write-Log 'Download failed but a local wallpaper exists - continuing with the existing file.' 'WARN'
+    }
+    else {
+        $newHash = (Get-FileHash $tempImage -Algorithm SHA256).Hash
+        $oldHash = if (Test-Path $imagePath) { (Get-FileHash $imagePath -Algorithm SHA256).Hash } else { '' }
+
+        if ($newHash -ne $oldHash) {
+            Copy-Item $tempImage $imagePath -Force
+            Write-Log 'Wallpaper image updated.' 'SUCCESS'
+            $changed += 'image'
+        }
+        else {
+            Write-Log 'Wallpaper image already up to date.'
+        }
+        Remove-Item $tempImage -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- 2. Apply to every loaded user hive ---------------------------------
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | ForEach-Object {
+        $sid = $_.PSChildName
+        if ($sid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') { return }
+
+        $desktopKey = "Registry::HKEY_USERS\$sid\Control Panel\Desktop"
+        if (-not (Test-Path $desktopKey)) { return }
+
+        $dirty = $false
+        if (Set-RegValueIfDifferent -Path $desktopKey -Name 'Wallpaper'      -Value $imagePath) { $dirty = $true }
+        if (Set-RegValueIfDifferent -Path $desktopKey -Name 'WallpaperStyle' -Value '10')       { $dirty = $true }  # 10 = Fill
+        if (Set-RegValueIfDifferent -Path $desktopKey -Name 'TileWallpaper'  -Value '0')        { $dirty = $true }
+
+        if ($dirty) {
+            Write-Log "Updated wallpaper registry for SID $sid" 'SUCCESS'
+            $changed += "hive $sid"
+        }
+    }
+
+    # --- 3. Apply to the default profile so NEW users get it too ------------
+    $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+    if (Test-Path $defaultHive) {
+        $loaded = $false
+        try {
+            $rc = Invoke-Native -FilePath 'reg.exe' -TimeoutSec 60 -Label 'reg-load' -Arguments @('load','HKU\KnixDefault', $defaultHive)
+            $loaded = ($rc -eq 0)
+        } catch { }
+
+        if ($loaded) {
+            try {
+                $k = 'Registry::HKEY_USERS\KnixDefault\Control Panel\Desktop'
+                if (Set-RegValueIfDifferent -Path $k -Name 'Wallpaper'      -Value $imagePath) { $changed += 'default profile' }
+                Set-RegValueIfDifferent -Path $k -Name 'WallpaperStyle' -Value '10' | Out-Null
+                Set-RegValueIfDifferent -Path $k -Name 'TileWallpaper'  -Value '0'  | Out-Null
+                Write-Log 'Default user profile wallpaper configured.'
+            }
+            finally {
+                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                Start-Sleep -Seconds 2
+                Invoke-Native -FilePath 'reg.exe' -Arguments @('unload','HKU\KnixDefault') -TimeoutSec 60 -Label 'reg-unload' | Out-Null
+            }
+        }
+        else {
+            Write-Log 'Could not load the default user hive (it may be in use) - skipping.' 'WARN'
+        }
+    }
+
+    # --- 4. Refresh live sessions, only if something changed ----------------
+    $users = Get-LoggedOnUser
+    if ($users.Count -eq 0) {
+        Write-Log 'No interactive sessions - the wallpaper applies at next logon.'
+    }
+    elseif ($changed.Count -eq 0) {
+        Write-Log 'Nothing changed - no session refresh needed.'
+    }
+    else {
+        foreach ($user in $users) {
+            $sid = ConvertTo-Sid -Account $user
+            if (-not $sid) { Write-Log "Could not resolve SID for $user - skipping refresh." 'WARN'; continue }
+
+            $taskName = 'Knix_SetWallpaper_' + ($user -replace '[^A-Za-z0-9_-]','_')
+
+            $userScript = @"
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class KnixWallpaper {
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+    public static void Apply(string path) {
+        SystemParametersInfo(20, 0, path, 0x01 | 0x02);
+    }
+}
+'@
+[KnixWallpaper]::Apply('$imagePath')
+"@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($userScript))
+
+            try {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+                $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $encoded"
+                $principal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+                $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+
+                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                Start-Sleep -Seconds 4
+                Write-Log "Wallpaper refreshed in session for $user" 'SUCCESS'
+            }
+            catch {
+                Write-Log "Live refresh failed for $user (applies at next logon): $($_.Exception.Message)" 'WARN'
+            }
+            finally {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    if ($changed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'Wallpaper already deployed' } }
+    return @{ Status = 'CHANGED'; Detail = (($changed | Select-Object -Unique) -join ', ') }
+}
+
+# ============================================================================
+# STEP 8 - BITLOCKER
+# Last on purpose, and it NEVER reboots unless -AllowReboot is passed. The old
+# script's "shutdown /r /t 60" is what killed the rest of the Atera chain.
+# ============================================================================
+
+Invoke-Step -Name 'BitLocker' -Body {
+
+    if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+        return @{ Status = 'SKIPPED'; Detail = 'BitLocker cmdlets unavailable (Home edition?)' }
+    }
+
+    # --- TPM ---------------------------------------------------------------
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        Write-Log "TPM present=$($tpm.TpmPresent) enabled=$($tpm.TpmEnabled) activated=$($tpm.TpmActivated) owned=$($tpm.TpmOwned)"
+
+        if (-not $tpm.TpmPresent)  { return @{ Status = 'FAILED'; Detail = 'No TPM detected - enable it in BIOS' } }
+        if (-not $tpm.TpmEnabled -or -not $tpm.TpmActivated) {
+            return @{ Status = 'FAILED'; Detail = 'TPM present but not enabled/activated in BIOS' }
+        }
+        if (-not $tpm.TpmOwned) {
+            Write-Log 'Initialising TPM ownership...'
+            try { Initialize-Tpm -AllowClear:$false -AllowPhysicalPresence:$false -ErrorAction Stop | Out-Null }
+            catch { Write-Log "Initialize-Tpm: $($_.Exception.Message)" 'WARN' }
+            Start-Sleep -Seconds 5
+        }
+    }
+    catch {
+        Write-Log "TPM query failed: $($_.Exception.Message) - continuing." 'WARN'
+    }
+
+    $vol = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+    Write-Log "C: VolumeStatus=$($vol.VolumeStatus) ProtectionStatus=$($vol.ProtectionStatus) Encryption=$($vol.EncryptionPercentage)%"
+    foreach ($kp in $vol.KeyProtector) { Write-Log "  Existing protector: $($kp.KeyProtectorType)" }
+
+    $actions = @()
+
+    # --- Protectors --------------------------------------------------------
+    if (-not ($vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'Tpm' })) {
+        Write-Log 'Adding TPM protector...'
+        try {
+            Add-BitLockerKeyProtector -MountPoint 'C:' -TpmProtector -ErrorAction Stop | Out-Null
+            $actions += 'added TPM protector'
+        }
+        catch {
+            Write-Log "Add-BitLockerKeyProtector (TPM) failed: $($_.Exception.Message) - trying manage-bde." 'WARN'
+            if ((Invoke-Native -FilePath 'manage-bde.exe' -Arguments @('-protectors','-add','C:','-tpm') -TimeoutSec 180 -Label 'bde-tpm') -eq 0) {
+                $actions += 'added TPM protector (manage-bde)'
+            }
+        }
+    }
+
+    if (-not ($vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })) {
+        Write-Log 'Adding recovery password protector...'
+        try {
+            Add-BitLockerKeyProtector -MountPoint 'C:' -RecoveryPasswordProtector -ErrorAction Stop | Out-Null
+            $actions += 'added recovery password'
+        }
+        catch {
+            Write-Log "Add-BitLockerKeyProtector (RecoveryPassword) failed: $($_.Exception.Message) - trying manage-bde." 'WARN'
+            if ((Invoke-Native -FilePath 'manage-bde.exe' -Arguments @('-protectors','-add','C:','-RecoveryPassword') -TimeoutSec 180 -Label 'bde-rp') -eq 0) {
+                $actions += 'added recovery password (manage-bde)'
+            }
+        }
+        Start-Sleep -Seconds 3
+    }
+
+    $vol = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+
+    # --- Encrypt / resume protection ---------------------------------------
+    if ($vol.VolumeStatus -eq 'FullyDecrypted') {
+        Write-Log 'Drive is not encrypted - starting encryption.'
+        try {
+            Enable-BitLocker -MountPoint 'C:' -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -RecoveryPasswordProtector -SkipHardwareTest -ErrorAction Stop | Out-Null
+            $actions += 'encryption started'
+        }
+        catch {
+            Write-Log "Enable-BitLocker failed: $($_.Exception.Message) - trying manage-bde." 'WARN'
+            $rc = Invoke-Native -FilePath 'manage-bde.exe' -Arguments @('-on','C:','-UsedSpaceOnly','-SkipHardwareTest') -TimeoutSec 300 -Label 'bde-on'
+            if ($rc -eq 0) { $actions += 'encryption started (manage-bde)' }
+            else           { Write-Log "manage-bde -on returned $rc" 'ERROR' }
+        }
+        $Script:RebootNeeded = $true
+    }
+    elseif ($vol.ProtectionStatus -ne 'On') {
+        Write-Log 'Drive is encrypted but protection is OFF - resuming.'
+        try {
+            Resume-BitLocker -MountPoint 'C:' -ErrorAction Stop | Out-Null
+            $actions += 'protection resumed'
+        }
+        catch {
+            Write-Log "Resume-BitLocker failed: $($_.Exception.Message) - trying manage-bde." 'WARN'
+            if ((Invoke-Native -FilePath 'manage-bde.exe' -Arguments @('-protectors','-enable','C:') -TimeoutSec 180 -Label 'bde-enable') -eq 0) {
+                $actions += 'protection resumed (manage-bde)'
+            }
+        }
+    }
+    else {
+        Write-Log 'BitLocker is already on and protecting the drive.'
+    }
+
+    Start-Sleep -Seconds 5
+    $final = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction SilentlyContinue
+
+    # --- Recovery key: escrow first, file second ---------------------------
+    $rp = $final.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+
+    if ($rp -and $rp.RecoveryPassword) {
+
+        # Escrow to Entra ID / Azure AD when the device is joined. This is the
+        # correct place for a recovery key - a plaintext file on the box is not.
+        $joined = $false
+        try {
+            $ds = & dsregcmd.exe /status 2>&1
+            $joined = [bool]($ds | Select-String -Pattern 'AzureAdJoined\s*:\s*YES' -Quiet)
+        } catch { }
+
+        if ($joined) {
+            try {
+                BackupToAAD-BitLockerKeyProtector -MountPoint 'C:' -KeyProtectorId $rp.KeyProtectorId -ErrorAction Stop
+                Write-Log 'Recovery key escrowed to Entra ID.' 'SUCCESS'
+                $actions += 'key escrowed to Entra ID'
+            }
+            catch { Write-Log "Entra ID escrow failed: $($_.Exception.Message)" 'WARN' }
+        }
+        else {
+            Write-Log 'Device is not Entra ID joined - no cloud escrow performed.' 'WARN'
+        }
+
+        # Local copy, restricted to SYSTEM + Administrators.
+        $keyFile = Join-Path $Script:StateDir 'BitLocker-RecoveryKey.txt'
+        try {
+            "Computer : $env:COMPUTERNAME`r`nSaved    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nKeyID    : $($rp.KeyProtectorId)`r`nKey      : $($rp.RecoveryPassword)" |
+                Out-File -FilePath $keyFile -Encoding ASCII -Force
+
+            $acl = Get-Acl $keyFile
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+            foreach ($who in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
+                $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    $who,'FullControl','Allow')))
+            }
+            Set-Acl -Path $keyFile -AclObject $acl
+            Write-Log "Recovery key written to $keyFile (SYSTEM/Administrators only)."
+        }
+        catch { Write-Log "Could not write the local recovery key file: $($_.Exception.Message)" 'WARN' }
+
+        # Surfaced in Atera output so it is captured centrally.
+        Write-Log "BITLOCKER RECOVERY KEY ($env:COMPUTERNAME): $($rp.RecoveryPassword)"
+
+        # Old script's insecure drop on the root of C:.
+        if (Test-Path 'C:\BitLocker_RecoveryKey.txt') {
+            Remove-Item 'C:\BitLocker_RecoveryKey.txt' -Force -ErrorAction SilentlyContinue
+            Write-Log 'Removed the old world-readable C:\BitLocker_RecoveryKey.txt.' 'SUCCESS'
+            $actions += 'removed insecure key file'
+        }
+    }
+    else {
+        Write-Log 'No recovery password protector available to save yet.' 'WARN'
+    }
+
+    Write-Log "FINAL: VolumeStatus=$($final.VolumeStatus) ProtectionStatus=$($final.ProtectionStatus) Encryption=$($final.EncryptionPercentage)%"
+
+    if ($final.ProtectionStatus -eq 'On') {
+        $detail = if ($actions) { "Protection ON - $($actions -join ', ')" } else { 'Protection ON - already compliant' }
+        return @{ Status = $(if ($actions) { 'CHANGED' } else { 'ALREADY OK' }); Detail = $detail }
+    }
+
+    $Script:RebootNeeded = $true
+    return @{
+        Status = 'PENDING'
+        Detail = "Status=$($final.VolumeStatus)/$($final.ProtectionStatus) at $($final.EncryptionPercentage)% - reboot required to finish"
+    }
+}
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+Write-Log ''
+Write-Log '############################################################'
+Write-Log "ONBOARDING SUMMARY - $env:COMPUTERNAME"
+Write-Log '############################################################'
+
+$failedSteps = @()
+
+foreach ($r in $Script:Results) {
+    $line = "{0,-14} {1,-11} {2,6}s  {3}" -f $r.Step, $r.Status, $r.Seconds, $r.Detail
+    $lvl  = if ($r.Status -eq 'FAILED') { 'ERROR' } elseif ($r.Status -in @('PENDING','SKIPPED')) { 'WARN' } else { 'SUCCESS' }
+    Write-Log $line $lvl
+    if ($r.Status -eq 'FAILED') { $failedSteps += $r.Step }
+}
+
+if (Test-PendingReboot) { $Script:RebootNeeded = $true }
+
+# ----------------------------------------------------------------------------
+# POST-FLIGHT VERIFICATION
+# Re-reads the machine's real state so a step that "succeeded" without actually
+# landing is still caught before we tell anyone the device is ready.
+# ----------------------------------------------------------------------------
+Write-Log ''
+Write-Log '--------------------- POST-INSTALL CHECKS ------------------'
+
+$health = @()
+try   { $health = @(Get-DeviceHealth) }
+catch { Write-Log "Health check itself failed: $($_.Exception.Message)" 'ERROR' }
+
+foreach ($h in $health) {
+    $mark = switch ($h.Healthy) {
+        $true   { 'PASS' }
+        $false  { 'FAIL' }
+        default { 'SKIP' }
+    }
+    $lvl = switch ($h.Healthy) {
+        $true   { 'SUCCESS' }
+        $false  { 'ERROR' }
+        default { 'WARN' }
+    }
+    Write-Log ("{0}  {1,-20} {2}" -f $mark, $h.Name, $h.Detail) $lvl
+}
+
+$unhealthy = @($health | Where-Object { $_.Healthy -eq $false })
+
+Write-Log '------------------------------------------------------------'
+if ($failedSteps.Count -eq 0 -and $unhealthy.Count -eq 0) {
+    Write-Log 'DEVICE READY - every post-install check passed.' 'SUCCESS'
+}
+else {
+    Write-Log "DEVICE NOT READY - $($unhealthy.Count) failed check(s), $($failedSteps.Count) failed step(s)." 'ERROR'
+}
+
+Write-Log "Reboot required: $Script:RebootNeeded"
+Write-Log "Full log: $Script:LogFile"
+
+# State file so the next run (and you) can see what happened last time.
+try {
+    [pscustomobject]@{
+        LastRun       = (Get-Date -Format 'o')
+        Computer      = $env:COMPUTERNAME
+        RebootNeeded  = $Script:RebootNeeded
+        DeviceReady   = ($failedSteps.Count -eq 0 -and $unhealthy.Count -eq 0)
+        Results       = $Script:Results
+        Health        = $health
+    } | ConvertTo-Json -Depth 4 | Out-File (Join-Path $Script:StateDir 'onboarding-state.json') -Encoding UTF8 -Force
+} catch { }
+
+# ----------------------------------------------------------------------------
+# SLACK NOTIFICATION
+# Sent last, and never allowed to change the script's outcome.
+# ----------------------------------------------------------------------------
+try {
+    Send-SlackSummary -Results @($Script:Results) -Health $health -RebootNeeded $Script:RebootNeeded
+}
+catch {
+    Write-Log "Slack summary failed to send: $($_.Exception.Message)" 'WARN'
+}
+
+if ($Script:RebootNeeded -and $AllowReboot) {
+    Write-Log 'AllowReboot was set - restarting in 5 minutes.' 'WARN'
+    & shutdown.exe /r /t 300 /c 'Knix device setup: restarting to finish configuration.'
+}
+elseif ($Script:RebootNeeded) {
+    Write-Log 'A reboot is needed to finish (BitLocker and/or installers). Reboot via Atera or pass -AllowReboot.' 'WARN'
+}
+
+if ($failedSteps.Count -gt 0) {
+    Write-Log "FAILED STEPS: $($failedSteps -join ', ')" 'ERROR'
+    exit 1
+}
+
+if ($unhealthy.Count -gt 0) {
+    Write-Log "FAILED CHECKS: $(($unhealthy | ForEach-Object { $_.Name }) -join ', ')" 'ERROR'
+    exit 1
+}
+
+Write-Log 'All steps completed and every post-install check passed.' 'SUCCESS'
+exit 0
