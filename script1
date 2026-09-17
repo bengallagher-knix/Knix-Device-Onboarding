@@ -75,9 +75,16 @@ param(
 # ############################################################################
 
     # Bot User OAuth Token, e.g. 'xoxb-1234567890-...'
+    #
+    # LEAVE THIS BLANK IN GIT. A committed Slack token is a leaked token:
+    # Slack's secret scanner auto-revokes tokens found in public repos, and
+    # rewriting git history to remove one is painful. Supply it at runtime via
+    # the KNIX_SLACK_TOKEN environment variable, which the bootstrap sets.
+    # A value here (if you insist) still wins over the environment variable.
     [string]$SlackBotToken = '',
 
-    # Channel ID (preferred, e.g. 'C09ABCDEFGH') or name (e.g. '#it-alerts')
+    # Channel ID (preferred, e.g. 'C09ABCDEFGH') or name (e.g. '#it-alerts').
+    # NOT a secret - safe to commit. Can also come from KNIX_SLACK_CHANNEL.
     [string]$SlackChannel = '',
 
     # Optional mention prepended to failure alerts only.
@@ -151,6 +158,9 @@ Write-Host "=== KNIX ONBOARDING STARTING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss
 # command line.
 if ([string]::IsNullOrWhiteSpace($SlackBotToken) -and $env:KNIX_SLACK_TOKEN) {
     $SlackBotToken = $env:KNIX_SLACK_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($SlackChannel) -and $env:KNIX_SLACK_CHANNEL) {
+    $SlackChannel = $env:KNIX_SLACK_CHANNEL
 }
 
 # ============================================================================
@@ -701,19 +711,71 @@ function Get-UninstallEntry {
     return $results
 }
 
+function Get-WingetPath {
+    try {
+        $p = Get-ChildItem -Path (Join-Path $env:ProgramFiles 'WindowsApps') -Filter 'winget.exe' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*Microsoft.DesktopAppInstaller*' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($p) { return $p.FullName }
+    } catch { }
+    return $null
+}
+
 <#
-    Runs an uninstall entry as quietly as the vendor allows.
-    MSI products get a proper /X {code} /qn. Everything else gets its
-    QuietUninstallString, or its UninstallString plus a best-guess silent flag.
+    Splits an uninstall string into the executable and its baked-in arguments.
+    Going through cmd.exe mangles quoting on paths with spaces, so the exe is
+    launched directly instead.
+#>
+function Get-ExeAndArgs {
+    param([Parameter(Mandatory)][string]$CommandLine)
+
+    $s = $CommandLine.Trim()
+
+    if ($s.StartsWith('"')) {
+        $end = $s.IndexOf('"', 1)
+        if ($end -gt 0) {
+            return [pscustomobject]@{
+                Exe  = $s.Substring(1, $end - 1)
+                Args = $s.Substring($end + 1).Trim()
+            }
+        }
+    }
+
+    $m = [regex]::Match($s, '^(?<exe>.*?\.exe)\b\s*(?<rest>.*)$', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($m.Success) {
+        return [pscustomobject]@{ Exe = $m.Groups['exe'].Value.Trim(); Args = $m.Groups['rest'].Value.Trim() }
+    }
+
+    return [pscustomobject]@{ Exe = $s; Args = '' }
+}
+
+<#
+    Runs an uninstaller without ever waiting on a dialog nobody can see.
+
+    Atera runs as SYSTEM in session 0. Any uninstaller that pops a window there
+    blocks until the timeout, because the window is drawn on a desktop with no
+    human attached. Defences:
+
+      * SHORT per-attempt timeout. A stuck uninstaller is killed in 90 seconds,
+        not 15 minutes, and its whole process tree goes with it.
+      * SEVERAL silent-switch conventions are tried in turn - NSIS, Inno Setup,
+        InstallShield, MSI-style - because vendors rarely document which one
+        their uninstaller actually uses. Guessing once is how this hung.
+      * Success is judged by the app DISAPPEARING from the registry, not by an
+        exit code. GUI uninstallers routinely return 0 having done nothing.
+      * Two consecutive hangs means the uninstaller is interactive-only, so it
+        stops rather than burning the rest of the budget.
+      * winget uninstall as a last resort.
 #>
 function Invoke-UninstallEntry {
     param(
         [Parameter(Mandatory)]$Entry,
-        [int]$TimeoutSec = 900
+        [int]$TimeoutSec = 90,
+        [string]$VerifyNameLike
     )
 
     $name = $Entry.DisplayName
-    $cmd  = $Entry.QuietUninstallString
+    if (-not $VerifyNameLike) { $VerifyNameLike = $name }
+
+    $cmd = $Entry.QuietUninstallString
     if (-not $cmd) { $cmd = $Entry.UninstallString }
 
     if (-not $cmd) {
@@ -721,37 +783,98 @@ function Invoke-UninstallEntry {
         return $false
     }
 
-    # MSI: rebuild the command properly instead of trusting the stored string.
+    # --- MSI products: rebuild the command rather than trust the stored one ---
     if ($cmd -match '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') {
         $productCode = $Matches[0]
         Write-Log "Uninstalling $name via MSI product code $productCode"
-        $code = Invoke-Native -FilePath 'msiexec.exe' -TimeoutSec $TimeoutSec -Label "uninstall-$name" -Arguments @('/X', $productCode, '/qn', '/norestart')
+        $code = Invoke-Native -FilePath 'msiexec.exe' -TimeoutSec 600 -Label "uninstall-$name" -Arguments @('/X', $productCode, '/qn', '/norestart')
         if ($code -in @(0,1605,1614,1641,3010)) {
             if ($code -in @(1641,3010)) { $Script:RebootNeeded = $true }
             Write-Log "$name removed (exit $code)." 'SUCCESS'
             return $true
         }
-        Write-Log "$name uninstall returned $code." 'WARN'
+        Write-Log "$name MSI uninstall returned $code." 'WARN'
         return $false
     }
 
-    # EXE: add a silent switch if the vendor did not supply a quiet string.
-    if (-not $Entry.QuietUninstallString) {
-        if ($cmd -notmatch '(?i)(/s\b|/silent|/quiet|/qn|--silent)') {
-            $cmd = "$cmd /S"
+    # --- EXE uninstallers -----------------------------------------------------
+    $parsed = Get-ExeAndArgs -CommandLine $cmd
+
+    if (-not (Test-Path $parsed.Exe)) {
+        Write-Log "$name uninstaller is not on disk: $($parsed.Exe)" 'WARN'
+        return $false
+    }
+
+    $baked = $parsed.Args
+    $attempts = New-Object System.Collections.ArrayList
+
+    # A vendor-supplied quiet string is tried first, exactly as written.
+    if ($Entry.QuietUninstallString) { [void]$attempts.Add($baked) }
+
+    # /S          NSIS
+    # /VERYSILENT Inno Setup (with message boxes suppressed)
+    # /s          InstallShield and various others
+    # /quiet      MSI-style wrappers
+    # --silent    Chromium-style and newer vendor installers
+    foreach ($sw in @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '/s', '/quiet /norestart', '--silent')) {
+        $candidate = ("$baked $sw").Trim()
+        if (-not $attempts.Contains($candidate)) { [void]$attempts.Add($candidate) }
+    }
+
+    $attemptNumber = 0
+    $consecutiveHangs = 0
+
+    foreach ($argString in $attempts) {
+
+        $attemptNumber++
+        Write-Log "$name uninstall attempt $attemptNumber of $($attempts.Count): $($parsed.Exe) $argString"
+
+        if ([string]::IsNullOrWhiteSpace($argString)) {
+            $code = Invoke-Native -FilePath $parsed.Exe -TimeoutSec $TimeoutSec -Label "uninstall-$attemptNumber"
+        }
+        else {
+            $code = Invoke-Native -FilePath $parsed.Exe -TimeoutSec $TimeoutSec -Label "uninstall-$attemptNumber" -Arguments @($argString)
+        }
+
+        if ($code -eq -1) {
+            $consecutiveHangs++
+            Write-Log "Attempt $attemptNumber hung and was killed - that switch is not silent for this uninstaller." 'WARN'
+        }
+        else {
+            $consecutiveHangs = 0
+        }
+
+        Start-Sleep -Seconds 3
+
+        if (@(Get-UninstallEntry -NameLike $VerifyNameLike).Count -eq 0) {
+            Write-Log "$name is gone after attempt $attemptNumber (exit $code)." 'SUCCESS'
+            if ($code -in @(1641,3010)) { $Script:RebootNeeded = $true }
+            return $true
+        }
+
+        Write-Log "$name still present after attempt $attemptNumber (exit $code)." 'WARN'
+
+        if ($consecutiveHangs -ge 2) {
+            Write-Log "$name hung twice in a row - its uninstaller needs an interactive desktop. Giving up on switch guessing." 'ERROR'
+            break
         }
     }
 
-    Write-Log "Uninstalling $name via: $cmd"
-    $code = Invoke-Native -FilePath "$env:WINDIR\System32\cmd.exe" -TimeoutSec $TimeoutSec -Label "uninstall-$name" -Arguments @('/c', $cmd)
-
-    if ($code -in @(0,1605,1614,1641,3010)) {
-        if ($code -in @(1641,3010)) { $Script:RebootNeeded = $true }
-        Write-Log "$name removed (exit $code)." 'SUCCESS'
-        return $true
+    # --- Last resort: winget --------------------------------------------------
+    $winget = Get-WingetPath
+    if ($winget) {
+        Write-Log "Trying winget uninstall for $name..."
+        $code = Invoke-Native -FilePath $winget -TimeoutSec 300 -Label 'winget-uninstall' -Arguments @('uninstall', '--name', $name, '--silent', '--accept-source-agreements', '--disable-interactivity')
+        Start-Sleep -Seconds 3
+        if (@(Get-UninstallEntry -NameLike $VerifyNameLike).Count -eq 0) {
+            Write-Log "$name removed by winget." 'SUCCESS'
+            return $true
+        }
+        Write-Log "winget did not remove $name (exit $code)." 'WARN'
     }
 
-    Write-Log "$name uninstall returned $code." 'WARN'
+    Write-Log "$name could NOT be removed silently. Uninstaller: $($parsed.Exe)" 'ERROR'
+    Write-Log 'Find the correct silent switch for that uninstaller and add it to the attempts list.' 'ERROR'
     return $false
 }
 
