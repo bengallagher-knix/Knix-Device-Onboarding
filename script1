@@ -141,6 +141,22 @@ param(
     # On by default - without it Windows re-adds OneDrive for new profiles.
     [bool]$BlockOneDriveReinstall = $true,
 
+    # ------------------------------------------------------------------------
+    # DESTRUCTIVE: delete users' OneDrive folders AND EVERYTHING IN THEM.
+    #
+    # ON at your instruction - OneDrive is not permitted at Knix, so the local
+    # folders go with the client. This PERMANENTLY DELETES local files. There
+    # is no recycle bin and no undo.
+    #
+    # Anything that exists only in the cloud and was never synced down is not
+    # affected here; it stays in the user's Microsoft account and simply
+    # becomes unreachable from this PC once the client is gone.
+    #
+    # Every folder and its file count is logged before deletion. Set to $false
+    # to delete only folders that are already empty.
+    # ------------------------------------------------------------------------
+    [bool]$PurgeOneDriveUserFolders = $true,
+
     # Step names to skip, e.g. -Skip BitLocker,Wallpaper
     [ValidateSet('Malwarebytes','Splashtop','CoreApps','RemoveLenovoAI','RemoveOneDrive','ServiceDesk','Wallpaper','BitLocker')]
     [string[]]$Skip = @(),
@@ -529,6 +545,125 @@ function Invoke-Native {
 }
 
 <#
+    Runs a process that may never exit, and stops waiting once the job is
+    actually done.
+
+    Some installers launch their service or tray app and leave the parent
+    process resident forever - Splashtop's Streamer is the classic example. A
+    plain WaitForExit then blocks for the whole timeout even though the install
+    finished in thirty seconds. Others pop a dialog invisible from session 0.
+
+    So instead of waiting on the process, this polls a success CONDITION. The
+    moment the condition is true the work is done, whatever the process is
+    doing. The process gets a grace period to tidy up, then its tree is killed.
+
+    Returns a hashtable: Success, ExitCode, Killed, Seconds.
+#>
+function Invoke-NativeUntil {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory)][scriptblock]$SuccessTest,
+        [int]$TimeoutSec = 420,
+        [int]$PollSeconds = 5,
+        [int]$GraceSeconds = 45,
+        [string]$Label
+    )
+
+    if (-not $Label) { $Label = Split-Path $FilePath -Leaf }
+
+    $outFile = Join-Path $Script:LogDir ("proc_{0}_{1}.out.log" -f ($Label -replace '[^A-Za-z0-9_-]','_'), (Get-Date -Format 'HHmmss'))
+    $errFile = [IO.Path]::ChangeExtension($outFile, 'err.log')
+
+    Write-Log "Running (polled): $FilePath $($Arguments -join ' ')  (max ${TimeoutSec}s)"
+
+    try {
+        $spArgs = @{
+            FilePath               = $FilePath
+            PassThru               = $true
+            NoNewWindow            = $true
+            RedirectStandardOutput = $outFile
+            RedirectStandardError  = $errFile
+            ErrorAction            = 'Stop'
+        }
+        if ($Arguments.Count -gt 0) { $spArgs['ArgumentList'] = $Arguments }
+        $proc = Start-Process @spArgs
+    }
+    catch {
+        Write-Log "Could not start $FilePath : $($_.Exception.Message)" 'ERROR'
+        return @{ Success = $false; ExitCode = -2; Killed = $false; Seconds = 0 }
+    }
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $satisfied = $false
+    $satisfiedAt = 0
+
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+
+        Start-Sleep -Seconds $PollSeconds
+
+        if (-not $satisfied) {
+            try { $satisfied = [bool](& $SuccessTest) } catch { $satisfied = $false }
+            if ($satisfied) {
+                $satisfiedAt = $sw.Elapsed.TotalSeconds
+                Write-Log "$Label : success condition met after $([math]::Round($satisfiedAt,0))s."
+            }
+        }
+
+        if ($proc.HasExited) {
+            Write-Log "$Label exited on its own after $([math]::Round($sw.Elapsed.TotalSeconds,0))s."
+            break
+        }
+
+        if ($satisfied -and (($sw.Elapsed.TotalSeconds - $satisfiedAt) -ge $GraceSeconds)) {
+            Write-Log "$Label still running ${GraceSeconds}s after succeeding - killing its process tree." 'WARN'
+            try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+            Start-Sleep -Seconds 2
+            break
+        }
+    }
+
+    $killed = $false
+    if (-not $proc.HasExited) {
+        if (-not $satisfied) {
+            Write-Log "$Label exceeded ${TimeoutSec}s without succeeding - killing its process tree." 'ERROR'
+        }
+        try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+        $killed = $true
+        Start-Sleep -Seconds 2
+    }
+
+    $exitCode = -1
+    try { if ($proc.HasExited) { $exitCode = $proc.ExitCode } } catch { }
+
+    foreach ($f in @($outFile, $errFile)) {
+        if (Test-Path $f) {
+            $content = (Get-Content $f -Raw -ErrorAction SilentlyContinue)
+            if ($content -and $content.Trim()) {
+                $snippet = $content.Trim()
+                if ($snippet.Length -gt 1000) { $snippet = $snippet.Substring(0,1000) + ' ...[truncated]' }
+                Write-Log "$Label output: $snippet"
+            }
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # One last look, in case it landed right at the end.
+    if (-not $satisfied) {
+        Start-Sleep -Seconds 5
+        try { $satisfied = [bool](& $SuccessTest) } catch { }
+    }
+
+    $sw.Stop()
+    return @{
+        Success  = $satisfied
+        ExitCode = $exitCode
+        Killed   = $killed
+        Seconds  = [math]::Round($sw.Elapsed.TotalSeconds, 0)
+    }
+}
+
+<#
     Download with retries, a timeout, a minimum-size sanity check (catches HTML
     error pages), and a curl.exe fallback.
 #>
@@ -650,12 +785,29 @@ function Test-InstallerSignature {
     return $false
 }
 
+<#
+    Finds an installed app by display name.
+
+    Searches the machine hives AND every loaded user hive. Per-user installs
+    (Slack, Teams, Zoom and friends put themselves in HKCU) are invisible to an
+    HKLM-only search, which makes a script reinstall software that is already
+    there.
+#>
 function Get-InstalledApp {
     param([Parameter(Mandatory)][string]$NameLike)
+
     $keys = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
+
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' } |
+        ForEach-Object {
+            $keys += "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            $keys += "Registry::HKEY_USERS\$($_.PSChildName)\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        }
+
     foreach ($k in $keys) {
         $hit = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue |
                Where-Object { $_.DisplayName -like $NameLike } |
@@ -663,6 +815,36 @@ function Get-InstalledApp {
         if ($hit) { return $hit }
     }
     return $null
+}
+
+<#
+    True if any user profile on the box contains the given relative path.
+    Catches per-user installs that leave nothing in a machine hive.
+#>
+function Test-PerUserPath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $profileRoot = Split-Path $env:PUBLIC -Parent
+    if (-not (Test-Path $profileRoot)) { $profileRoot = 'C:\Users' }
+
+    $hit = Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -notin @('Public','All Users','Default','Default User') } |
+           ForEach-Object { Join-Path $_.FullName $RelativePath } |
+           Where-Object { Test-Path $_ } |
+           Select-Object -First 1
+
+    return [bool]$hit
+}
+
+<#
+    True if a matching Appx/MSIX package is installed for any user.
+#>
+function Test-AppxInstalled {
+    param([Parameter(Mandatory)][string]$NameLike)
+    try {
+        return [bool](@(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -like $NameLike }).Count -gt 0)
+    } catch { return $false }
 }
 
 # ----------------------------------------------------------------------------
@@ -702,6 +884,7 @@ function Get-UninstallEntry {
                                 DisplayVersion     = $_.DisplayVersion
                                 UninstallString    = $_.UninstallString
                                 QuietUninstallString = $_.QuietUninstallString
+                                InstallLocation    = $_.InstallLocation
                                 Scope              = $root.Scope
                                 KeyPath            = $_.PSPath
                             }
@@ -816,7 +999,18 @@ function Invoke-UninstallEntry {
     # /s          InstallShield and various others
     # /quiet      MSI-style wrappers
     # --silent    Chromium-style and newer vendor installers
-    foreach ($sw in @('/S', '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '/s', '/quiet /norestart', '--silent')) {
+    foreach ($sw in @(
+        '/S',
+        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
+        '/s',
+        '/quiet /norestart',
+        '--silent',
+        '/uninstall /quiet',          # Advanced Installer bootstrappers
+        '/x /qn',                     # MSI wrapper style
+        '/exenoui /qn',               # Advanced Installer, no bootstrapper UI
+        '-s -uninst',                 # older InstallShield
+        '/SILENT /NORESTART'
+    )) {
         $candidate = ("$baked $sw").Trim()
         if (-not $attempts.Contains($candidate)) { [void]$attempts.Add($candidate) }
     }
@@ -936,6 +1130,106 @@ function Remove-AppxByPattern {
     }
 
     return @($removed | Sort-Object -Unique)
+}
+
+<#
+    Last-resort removal for software whose uninstaller cannot be driven from
+    session 0. Deletes the install directory, its uninstall registry key, Start
+    Menu shortcuts and autostart entries.
+
+    This is deliberately blunt. It is for OEM bloatware that refuses to leave,
+    not for anything a user has data in. Every path is logged before deletion.
+#>
+function Remove-AppByForce {
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [switch]$DryRun
+    )
+
+    $name = $Entry.DisplayName
+    Write-Log "FORCE REMOVAL of '$name' - its uninstaller could not be run silently." 'WARN'
+
+    $removed = $false
+
+    # --- 1. Work out the install directory ----------------------------------
+    $dir = $null
+    if ($Entry.InstallLocation -and (Test-Path $Entry.InstallLocation)) {
+        $dir = $Entry.InstallLocation
+    }
+    else {
+        $cmd = $Entry.QuietUninstallString
+        if (-not $cmd) { $cmd = $Entry.UninstallString }
+        if ($cmd) {
+            $parsed = Get-ExeAndArgs -CommandLine $cmd
+            if ($parsed.Exe -and (Test-Path $parsed.Exe)) { $dir = Split-Path $parsed.Exe -Parent }
+        }
+    }
+
+    # --- 2. Kill anything running from that directory -----------------------
+    if ($dir) {
+        foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
+            try {
+                if ($proc.Path -and $proc.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) {
+                    if ($DryRun) { Write-Log "[DRY RUN] would kill $($proc.Name) (PID $($proc.Id))" 'WARN'; continue }
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                    Write-Log "Killed $($proc.Name) (PID $($proc.Id)) running from the install folder."
+                }
+            } catch { }
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    # --- 3. Delete the install directory ------------------------------------
+    if ($dir -and (Test-Path $dir)) {
+        # Refuse to touch anything that is not clearly a program folder.
+        $safe = $dir -match '(?i)^[A-Z]:\\Program Files( \(x86\))?\\' -or $dir -match '(?i)^[A-Z]:\\ProgramData\\'
+        if (-not $safe) {
+            Write-Log "Refusing to force-delete '$dir' - it is not under Program Files or ProgramData." 'ERROR'
+        }
+        elseif ($DryRun) {
+            Write-Log "[DRY RUN] would delete folder $dir" 'WARN'
+            $removed = $true
+        }
+        else {
+            try {
+                Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
+                Write-Log "Deleted install folder $dir" 'SUCCESS'
+                $removed = $true
+            }
+            catch { Write-Log "Could not delete $dir : $($_.Exception.Message)" 'WARN' }
+        }
+    }
+
+    # --- 4. Delete the uninstall registry key -------------------------------
+    if ($Entry.KeyPath) {
+        if ($DryRun) { Write-Log "[DRY RUN] would delete registry key $($Entry.KeyPath)" 'WARN' }
+        else {
+            try {
+                Remove-Item -LiteralPath $Entry.KeyPath -Recurse -Force -ErrorAction Stop
+                Write-Log "Deleted uninstall registry key for $name." 'SUCCESS'
+                $removed = $true
+            }
+            catch { Write-Log "Could not delete the registry key: $($_.Exception.Message)" 'WARN' }
+        }
+    }
+
+    # --- 5. Start Menu shortcuts --------------------------------------------
+    $menus = @(
+        (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
+        (Join-Path $env:PUBLIC 'Desktop')
+    )
+    foreach ($menu in $menus) {
+        if (-not (Test-Path $menu)) { continue }
+        Get-ChildItem -Path $menu -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*$($name.Split(' ')[0])*" -and $_.Extension -in @('.lnk','.url') } |
+            ForEach-Object {
+                if ($DryRun) { Write-Log "[DRY RUN] would delete shortcut $($_.FullName)" 'WARN'; return }
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log "Removed shortcut $($_.FullName)"
+            }
+    }
+
+    return $removed
 }
 
 function Stop-ProcessByName {
@@ -1132,7 +1426,9 @@ function Get-DeviceHealth {
                [bool](Get-InstalledApp -NameLike 'Google Chrome') } },
         @{ Name = 'Slack'; Test = {
                [bool](Get-InstalledApp -NameLike '*Slack*') -or
-               (Test-Path 'C:\Program Files\Slack\slack.exe') } },
+               (Test-Path 'C:\Program Files\Slack\slack.exe') -or
+               (Test-PerUserPath -RelativePath 'AppData\Local\slack\slack.exe') -or
+               (Test-AppxInstalled -NameLike '*Slack*') } },
         @{ Name = 'Google Drive'; Test = {
                [bool](Get-ChildItem 'C:\Program Files\Google\Drive File Stream' -Filter 'GoogleDriveFS.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) } }
     )
@@ -1548,23 +1844,39 @@ Invoke-Step -Name 'Splashtop' -Body {
 
     # Splashtop Easy Deployment syntax. dcode= is what stops the Streamer from
     # prompting for the deployment code after install.
+    #
+    # The installer routinely does NOT exit - it starts the Streamer and stays
+    # resident - so waiting on the process is how this used to hang for the
+    # full timeout. Success is polled for instead: the moment the Streamer is
+    # detected on disk, the install is done and we stop waiting.
+    #
     # NOTE: no uninstall first. Re-running over an existing install applies the
     # new deployment configuration and keeps the machine reachable throughout.
     $argSets = @(
         @('prevercheck','/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"),
-        @('/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1")   # redundancy
+        @('/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"),
+        @('/s','/i', 'confirm_d=0,hidewindow=1'),   # deploy package: code is embedded
+        @('/s')
     )
 
     $installOk = $false
+    $attempt = 0
+
     foreach ($set in $argSets) {
-        $code = Invoke-Native -FilePath $exe -Arguments $set -TimeoutSec 900 -Label 'splashtop'
-        if ($code -in @(0, 1641, 3010)) {
-            if ($code -in @(1641, 3010)) { $Script:RebootNeeded = $true }
+
+        $attempt++
+
+        $result = Invoke-NativeUntil -FilePath $exe -Arguments $set -Label "splashtop-$attempt" -TimeoutSec 420 -PollSeconds 5 -GraceSeconds 45 -SuccessTest { Test-SplashtopInstalled }
+
+        if ($result.Success) {
+            Write-Log "Splashtop installed on attempt $attempt in $($result.Seconds)s (exit $($result.ExitCode), killed=$($result.Killed))." 'SUCCESS'
+            if ($result.ExitCode -in @(1641, 3010)) { $Script:RebootNeeded = $true }
             $installOk = $true
             break
         }
-        Write-Log "Splashtop install attempt returned $code - trying the next argument set." 'WARN'
-        Start-Sleep -Seconds 10
+
+        Write-Log "Splashtop attempt $attempt did not install (exit $($result.ExitCode)) - trying the next argument set." 'WARN'
+        Start-Sleep -Seconds 5
     }
 
     Remove-Item $exe -Force -ErrorAction SilentlyContinue
@@ -1641,8 +1953,13 @@ Invoke-Step -Name 'CoreApps' -Body {
             Publisher = 'Slack Technologies'
             Args      = @()
             Detect    = {
+                # Slack installs per-user by default, so a machine-hive-only
+                # check reports "missing" on a box that already has it.
                 [bool](Get-InstalledApp -NameLike '*Slack*') -or
-                (Test-Path 'C:\Program Files\Slack\slack.exe')
+                (Test-Path 'C:\Program Files\Slack\slack.exe') -or
+                (Test-PerUserPath -RelativePath 'AppData\Local\slack\slack.exe') -or
+                (Test-AppxInstalled -NameLike '*SlackTechnologies*') -or
+                (Test-AppxInstalled -NameLike '*Slack*')
             }
         },
         [pscustomobject]@{
@@ -1698,9 +2015,12 @@ Invoke-Step -Name 'CoreApps' -Body {
             $ok = Invoke-MsiInstall -MsiPath $path -Label ($app.Name -replace '\s','') -TimeoutSec 1200
         }
         else {
-            $code = Invoke-Native -FilePath $path -Arguments $app.Args -TimeoutSec 1200 -Label ($app.Name -replace '\s','')
-            if ($code -in @(0, 1641, 3010)) {
-                if ($code -in @(1641, 3010)) { $Script:RebootNeeded = $true }
+            # Polled, not waited on - a vendor EXE that stays resident after
+            # installing would otherwise stall the whole run.
+            $detect = $app.Detect
+            $res = Invoke-NativeUntil -FilePath $path -Arguments $app.Args -TimeoutSec 900 -GraceSeconds 30 -Label ($app.Name -replace '\s','') -SuccessTest $detect
+            if ($res.Success) {
+                if ($res.ExitCode -in @(1641, 3010)) { $Script:RebootNeeded = $true }
                 $ok = $true
             }
         }
@@ -1814,7 +2134,14 @@ Invoke-Step -Name 'RemoveLenovoAI' -Body {
                 $removed += $entry.DisplayName
                 continue
             }
-            if (Invoke-UninstallEntry -Entry $entry) { $removed += $entry.DisplayName }
+            if (Invoke-UninstallEntry -Entry $entry) {
+                $removed += $entry.DisplayName
+            }
+            elseif (Remove-AppByForce -Entry $entry -DryRun:$RemovalDryRun) {
+                # The uninstaller would not run silently from session 0, so the
+                # program folder and its registry key are removed directly.
+                $removed += "$($entry.DisplayName) (forced)"
+            }
         }
     }
 
@@ -2022,18 +2349,52 @@ Invoke-Step -Name 'RemoveOneDrive' -Body {
         if (Remove-EmptyDirectory -Path $folder -DryRun:$RemovalDryRun) { $removed += "folder $folder" }
     }
 
-    # User OneDrive data folders are only reported, never touched.
+    # --- 8b. Users' OneDrive data folders -----------------------------------
+    # With PurgeOneDriveUserFolders these are deleted outright, contents and
+    # all. Matches "OneDrive", "OneDrive - Knix", "OneDrive - Personal" etc.
     Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @('Public','All Users') } |
         ForEach-Object {
-            Get-ChildItem -Path $_.FullName -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
+            $userFolder = $_.FullName
+            Get-ChildItem -Path $userFolder -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
                 ForEach-Object {
-                    $count = @(Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
-                    if ($count -gt 0) {
-                        Write-Log "REVIEW: $($_.FullName) still holds $count file(s). Left untouched." 'WARN'
+                    $target = $_.FullName
+                    $count = @(Get-ChildItem -LiteralPath $target -Recurse -File -ErrorAction SilentlyContinue).Count
+
+                    if (-not $PurgeOneDriveUserFolders) {
+                        if ($count -gt 0) { Write-Log "REVIEW: $target holds $count file(s). Left untouched." 'WARN' }
+                        else { Remove-EmptyDirectory -Path $target -DryRun:$RemovalDryRun | Out-Null }
+                        return
                     }
-                    else {
-                        Remove-EmptyDirectory -Path $_.FullName -DryRun:$RemovalDryRun | Out-Null
+
+                    # Guard: only ever delete <profile root>\<user>\OneDrive*,
+                    # never a profile root or anything shallower.
+                    $parent = Split-Path $target -Parent
+                    if ($parent -ne $userFolder) {
+                        Write-Log "Refusing to delete '$target' - unexpected location." 'ERROR'
+                        return
+                    }
+
+                    if ($RemovalDryRun) {
+                        Write-Log "[DRY RUN] would DELETE $target and its $count file(s)" 'WARN'
+                        $removed += "would purge $target"
+                        return
+                    }
+
+                    Write-Log "DELETING $target and its $count file(s) - OneDrive is not permitted." 'WARN'
+                    try {
+                        # Clear read-only/system attributes first; synced files
+                        # are frequently flagged and would block the delete.
+                        Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue |
+                            ForEach-Object {
+                                try { $_.Attributes = 'Normal' } catch { }
+                            }
+                        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+                        Write-Log "Deleted $target ($count file(s) removed)." 'SUCCESS'
+                        $removed += "purged $target"
+                    }
+                    catch {
+                        Write-Log "Could not delete $target : $($_.Exception.Message)" 'ERROR'
                     }
                 }
         }
