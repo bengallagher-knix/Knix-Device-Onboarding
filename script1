@@ -20,10 +20,9 @@
       2. Splashtop Streamer (with deployment code applied)
       3. Core apps: Google Chrome, Slack, Google Drive for Desktop
       4. Purge Lenovo AI (AI Now / Qira)
-      5. Purge OneDrive (client only - never touches user files)
-      6. Knix Service Desk desktop shortcut
-      7. Corporate wallpaper
-      8. BitLocker (never reboots unless -AllowReboot is passed)
+      5. Knix Service Desk desktop shortcut
+      6. Corporate wallpaper
+      7. BitLocker (never reboots unless -AllowReboot is passed)
 
 .NOTES
     Run as SYSTEM / Administrator. PowerShell 5.1.
@@ -137,28 +136,8 @@ param(
     # model line before letting it purge.
     [switch]$RemovalDryRun,
 
-    # Block OneDrive from coming back via policy (DisableFileSyncNGSC).
-    # On by default - without it Windows re-adds OneDrive for new profiles.
-    [bool]$BlockOneDriveReinstall = $true,
-
-    # ------------------------------------------------------------------------
-    # DESTRUCTIVE: delete users' OneDrive folders AND EVERYTHING IN THEM.
-    #
-    # ON at your instruction - OneDrive is not permitted at Knix, so the local
-    # folders go with the client. This PERMANENTLY DELETES local files. There
-    # is no recycle bin and no undo.
-    #
-    # Anything that exists only in the cloud and was never synced down is not
-    # affected here; it stays in the user's Microsoft account and simply
-    # becomes unreachable from this PC once the client is gone.
-    #
-    # Every folder and its file count is logged before deletion. Set to $false
-    # to delete only folders that are already empty.
-    # ------------------------------------------------------------------------
-    [bool]$PurgeOneDriveUserFolders = $true,
-
     # Step names to skip, e.g. -Skip BitLocker,Wallpaper
-    [ValidateSet('Malwarebytes','Splashtop','CoreApps','RemoveLenovoAI','RemoveOneDrive','ServiceDesk','Wallpaper','BitLocker')]
+    [ValidateSet('Malwarebytes','Splashtop','CoreApps','RemoveLenovoAI','ServiceDesk','Wallpaper','BitLocker')]
     [string[]]$Skip = @(),
 
     # BitLocker needs a reboot to finish. OFF by default so the script never
@@ -853,8 +832,8 @@ function Test-AppxInstalled {
 
 <#
     Finds uninstall entries across BOTH machine hives and every loaded user
-    hive. Per-user installs (OneDrive is the classic one) live under HKU and
-    are invisible to a plain HKLM search.
+    hive. Per-user installs (Slack is the classic one) live under HKU and are
+    invisible to a plain HKLM search.
 #>
 function Get-UninstallEntry {
     param([Parameter(Mandatory)][string]$NameLike)
@@ -1232,6 +1211,8 @@ function Remove-AppByForce {
     return $removed
 }
 
+
+
 function Stop-ProcessByName {
     param([Parameter(Mandatory)][string[]]$Names, [switch]$DryRun)
     $stopped = @()
@@ -1251,36 +1232,6 @@ function Stop-ProcessByName {
     return @($stopped | Sort-Object -Unique)
 }
 
-<#
-    Deletes a leftover directory - but ONLY if it is empty.
-    User data is never deleted by this script; a folder with anything in it is
-    reported for a human to look at instead.
-#>
-function Remove-EmptyDirectory {
-    param([Parameter(Mandatory)][string]$Path, [switch]$DryRun)
-
-    if (-not (Test-Path $Path)) { return $false }
-
-    $items = @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
-               Where-Object { -not $_.PSIsContainer })
-
-    if ($items.Count -gt 0) {
-        Write-Log "LEFT ALONE: $Path still contains $($items.Count) file(s) - not deleting user data." 'WARN'
-        return $false
-    }
-
-    if ($DryRun) { Write-Log "[DRY RUN] would remove empty folder $Path" 'WARN'; return $true }
-
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-        Write-Log "Removed empty folder $Path"
-        return $true
-    }
-    catch {
-        Write-Log "Could not remove $Path : $($_.Exception.Message)" 'WARN'
-        return $false
-    }
-}
 
 function Invoke-MsiInstall {
     param(
@@ -1462,28 +1413,6 @@ function Get-DeviceHealth {
             else                    { Add-HealthCheck 'Lenovo AI purged' $true  'no Lenovo AI components found' }
         }
     } catch { Add-HealthCheck 'Lenovo AI purged' $false "check error: $($_.Exception.Message)" }
-
-    # --- OneDrive purged ----------------------------------------------------
-    try {
-        if ($Skip -contains 'RemoveOneDrive') {
-            Add-HealthCheck 'OneDrive purged' 'SKIPPED' 'skipped by parameter'
-        }
-        else {
-            $odBits = @()
-            $odBits += @(Get-UninstallEntry -NameLike '*OneDrive*' | ForEach-Object { "$($_.DisplayName) [$($_.Scope)]" })
-            if (Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue) { $odBits += 'process running' }
-            $odBits += @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Name -like '*OneDrive*' } | ForEach-Object { $_.Name })
-            $odBits = @($odBits | Sort-Object -Unique)
-
-            if ($odBits.Count -gt 0) { Add-HealthCheck 'OneDrive purged' $false "still present: $($odBits -join ', ')" }
-            else {
-                $blocked = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' -Name 'DisableFileSyncNGSC' -ErrorAction SilentlyContinue).DisableFileSyncNGSC
-                $note = if ($blocked -eq 1) { 'removed, reinstall blocked by policy' } else { 'removed' }
-                Add-HealthCheck 'OneDrive purged' $true $note
-            }
-        }
-    } catch { Add-HealthCheck 'OneDrive purged' $false "check error: $($_.Exception.Message)" }
 
     # --- Service desk shortcut ---------------------------------------------
     try {
@@ -2188,240 +2117,7 @@ Invoke-Step -Name 'RemoveLenovoAI' -Body {
 }
 
 # ============================================================================
-# STEP 5 - PURGE ONEDRIVE
-#
-# IMPORTANT - USER DATA:
-#   This uninstalls the OneDrive CLIENT. It never deletes the contents of a
-#   user's OneDrive folder. Leftover folders are removed only when completely
-#   empty; anything still holding files is logged for a human to review.
-#
-#   Before running this fleet-wide, be sure nobody has files that exist ONLY
-#   in OneDrive. With Files On-Demand, a cloud-only file that was never
-#   downloaded is not in the local folder - uninstalling the client makes it
-#   unreachable from that PC (it stays in the user's cloud account).
-# ============================================================================
-
-Invoke-Step -Name 'RemoveOneDrive' -Body {
-
-    if ($RemovalDryRun) { Write-Log 'DRY RUN - nothing will actually be removed.' 'WARN' }
-
-    $removed = @()
-
-    # --- 1. Stop the client --------------------------------------------------
-    $stopped = Stop-ProcessByName -Names @('OneDrive','OneDriveSetup','FileCoAuth','FileSyncHelper') -DryRun:$RemovalDryRun
-    if ($stopped) { $removed += "stopped: $($stopped -join ', ')" }
-
-    # --- 2. Run every OneDriveSetup uninstaller we can find ------------------
-    # Machine copies plus one per user profile - OneDrive installs per-user, so
-    # a single uninstall call is never enough on a multi-profile machine.
-    $setupPaths = @(
-        (Join-Path $env:WINDIR 'SysWOW64\OneDriveSetup.exe'),
-        (Join-Path $env:WINDIR 'System32\OneDriveSetup.exe')
-    )
-
-    $profileRoot = Split-Path $env:PUBLIC -Parent
-    if (-not (Test-Path $profileRoot)) { $profileRoot = 'C:\Users' }
-
-    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notin @('Public','All Users') } |
-        ForEach-Object {
-            $base = Join-Path $_.FullName 'AppData\Local\Microsoft\OneDrive'
-            if (-not (Test-Path $base)) { return }
-
-            $direct = Join-Path $base 'OneDriveSetup.exe'
-            if (Test-Path $direct) { $setupPaths += $direct }
-
-            # Versioned subfolders: ...\OneDrive\24.201.1006.0005\OneDriveSetup.exe
-            Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    $versioned = Join-Path $_.FullName 'OneDriveSetup.exe'
-                    if (Test-Path $versioned) { $setupPaths += $versioned }
-                }
-        }
-
-    $setupPaths = @($setupPaths | Sort-Object -Unique | Where-Object { Test-Path $_ })
-
-    foreach ($setup in $setupPaths) {
-        if ($RemovalDryRun) { Write-Log "[DRY RUN] would run: $setup /uninstall" 'WARN'; $removed += $setup; continue }
-        $rc = Invoke-Native -FilePath $setup -Arguments @('/uninstall') -TimeoutSec 300 -Label 'onedrive-uninstall'
-        Write-Log "$setup /uninstall returned $rc"
-        $removed += 'ran OneDriveSetup /uninstall'
-    }
-
-    # --- 3. Registry uninstall entries (per-user installs live under HKU) ----
-    foreach ($entry in @(Get-UninstallEntry -NameLike '*OneDrive*')) {
-        Write-Log "Found uninstall entry: $($entry.DisplayName) [$($entry.Scope)]"
-        if ($RemovalDryRun) { Write-Log '[DRY RUN] would run its uninstall string' 'WARN'; continue }
-        if (Invoke-UninstallEntry -Entry $entry) { $removed += $entry.DisplayName }
-    }
-
-    # --- 4. Appx/MSIX variants ----------------------------------------------
-    $appxRemoved = Remove-AppxByPattern -Patterns @('*OneDrive*') -DryRun:$RemovalDryRun
-    if ($appxRemoved) { $removed += $appxRemoved }
-
-    # --- 5. Scheduled tasks --------------------------------------------------
-    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like '*OneDrive*' })) {
-        if ($RemovalDryRun) { Write-Log "[DRY RUN] would remove task $($t.TaskName)" 'WARN'; continue }
-        try {
-            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
-            Write-Log "Removed scheduled task $($t.TaskName)." 'SUCCESS'
-            $removed += "task $($t.TaskName)"
-        }
-        catch { Write-Log "Could not remove task $($t.TaskName): $($_.Exception.Message)" 'WARN' }
-    }
-
-    # --- 6. Explorer sidebar entry + per-user autostart ----------------------
-    $nsKeys = @(
-        'HKLM:\SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-        'HKLM:\SOFTWARE\Classes\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
-    )
-    foreach ($k in $nsKeys) {
-        if (-not (Test-Path $k)) { continue }
-        if ($RemovalDryRun) { Write-Log "[DRY RUN] would hide Explorer namespace entry at $k" 'WARN'; continue }
-        if (Set-RegValueIfDifferent -Path $k -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -Type 'DWord') {
-            Write-Log 'Removed OneDrive from the Explorer sidebar.'
-            $removed += 'explorer sidebar entry'
-        }
-    }
-
-    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$' } |
-        ForEach-Object {
-            $runKey = "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Run"
-            if (-not (Test-Path $runKey)) { return }
-            foreach ($valueName in @('OneDrive','OneDriveSetup')) {
-                if ($null -eq (Get-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue)) { continue }
-                if ($RemovalDryRun) { Write-Log "[DRY RUN] would remove autostart $valueName for $($_.PSChildName)" 'WARN'; continue }
-                Remove-ItemProperty -Path $runKey -Name $valueName -Force -ErrorAction SilentlyContinue
-                Write-Log "Removed autostart entry $valueName for SID $($_.PSChildName)."
-                $removed += "autostart $valueName"
-            }
-        }
-
-    # --- 7. Stop it coming back for new profiles ----------------------------
-    $defaultHive = 'C:\Users\Default\NTUSER.DAT'
-    if ((Test-Path $defaultHive) -and -not $RemovalDryRun) {
-        $rc = Invoke-Native -FilePath 'reg.exe' -TimeoutSec 60 -Label 'reg-load-od' -Arguments @('load','HKU\KnixDefaultOD', $defaultHive)
-        if ($rc -eq 0) {
-            try {
-                $runKey = 'Registry::HKEY_USERS\KnixDefaultOD\Software\Microsoft\Windows\CurrentVersion\Run'
-                if (Test-Path $runKey) {
-                    foreach ($valueName in @('OneDrive','OneDriveSetup')) {
-                        if ($null -ne (Get-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue)) {
-                            Remove-ItemProperty -Path $runKey -Name $valueName -Force -ErrorAction SilentlyContinue
-                            Write-Log "Removed $valueName autostart from the default profile."
-                            $removed += 'default profile autostart'
-                        }
-                    }
-                }
-            }
-            finally {
-                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                Start-Sleep -Seconds 2
-                Invoke-Native -FilePath 'reg.exe' -Arguments @('unload','HKU\KnixDefaultOD') -TimeoutSec 60 -Label 'reg-unload-od' | Out-Null
-            }
-        }
-        else { Write-Log 'Could not load the default user hive - skipping that cleanup.' 'WARN' }
-    }
-
-    if ($BlockOneDriveReinstall -and -not $RemovalDryRun) {
-        $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
-        if (Set-RegValueIfDifferent -Path $policyKey -Name 'DisableFileSyncNGSC' -Value 1 -Type 'DWord') {
-            Write-Log 'Policy set: OneDrive file sync disabled (DisableFileSyncNGSC=1).' 'SUCCESS'
-            $removed += 'reinstall blocked by policy'
-        }
-    }
-
-    # --- 8. Leftover folders - EMPTY ONES ONLY ------------------------------
-    $candidateFolders = @(
-        (Join-Path $env:ProgramFiles 'Microsoft OneDrive'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft OneDrive'),
-        (Join-Path $env:ProgramData 'Microsoft OneDrive')
-    )
-
-    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notin @('Public','All Users') } |
-        ForEach-Object {
-            $candidateFolders += (Join-Path $_.FullName 'AppData\Local\Microsoft\OneDrive')
-        }
-
-    foreach ($folder in ($candidateFolders | Where-Object { $_ } | Sort-Object -Unique)) {
-        if (Remove-EmptyDirectory -Path $folder -DryRun:$RemovalDryRun) { $removed += "folder $folder" }
-    }
-
-    # --- 8b. Users' OneDrive data folders -----------------------------------
-    # With PurgeOneDriveUserFolders these are deleted outright, contents and
-    # all. Matches "OneDrive", "OneDrive - Knix", "OneDrive - Personal" etc.
-    Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notin @('Public','All Users') } |
-        ForEach-Object {
-            $userFolder = $_.FullName
-            Get-ChildItem -Path $userFolder -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    $target = $_.FullName
-                    $count = @(Get-ChildItem -LiteralPath $target -Recurse -File -ErrorAction SilentlyContinue).Count
-
-                    if (-not $PurgeOneDriveUserFolders) {
-                        if ($count -gt 0) { Write-Log "REVIEW: $target holds $count file(s). Left untouched." 'WARN' }
-                        else { Remove-EmptyDirectory -Path $target -DryRun:$RemovalDryRun | Out-Null }
-                        return
-                    }
-
-                    # Guard: only ever delete <profile root>\<user>\OneDrive*,
-                    # never a profile root or anything shallower.
-                    $parent = Split-Path $target -Parent
-                    if ($parent -ne $userFolder) {
-                        Write-Log "Refusing to delete '$target' - unexpected location." 'ERROR'
-                        return
-                    }
-
-                    if ($RemovalDryRun) {
-                        Write-Log "[DRY RUN] would DELETE $target and its $count file(s)" 'WARN'
-                        $removed += "would purge $target"
-                        return
-                    }
-
-                    Write-Log "DELETING $target and its $count file(s) - OneDrive is not permitted." 'WARN'
-                    try {
-                        # Clear read-only/system attributes first; synced files
-                        # are frequently flagged and would block the delete.
-                        Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue |
-                            ForEach-Object {
-                                try { $_.Attributes = 'Normal' } catch { }
-                            }
-                        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
-                        Write-Log "Deleted $target ($count file(s) removed)." 'SUCCESS'
-                        $removed += "purged $target"
-                    }
-                    catch {
-                        Write-Log "Could not delete $target : $($_.Exception.Message)" 'ERROR'
-                    }
-                }
-        }
-
-    # --- 9. Verify -----------------------------------------------------------
-    if ($RemovalDryRun) {
-        return @{ Status = 'CHANGED'; Detail = "Dry run: $($removed.Count) action(s) would run" }
-    }
-
-    Start-Sleep -Seconds 3
-
-    $stillRunning = @(Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue)
-    $stillInstalled = @(Get-UninstallEntry -NameLike '*OneDrive*')
-
-    if ($stillRunning.Count -gt 0 -or $stillInstalled.Count -gt 0) {
-        $what = @()
-        if ($stillRunning.Count -gt 0)   { $what += 'process still running' }
-        if ($stillInstalled.Count -gt 0) { $what += "uninstall entries remain: $(($stillInstalled | ForEach-Object { "$($_.DisplayName) [$($_.Scope)]" }) -join ', ')" }
-        return @{ Status = 'FAILED'; Detail = ($what -join '; ') }
-    }
-
-    if ($removed.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'OneDrive not present' } }
-    return @{ Status = 'CHANGED'; Detail = "Removed: $(($removed | Select-Object -Unique | Select-Object -First 8) -join ', ')" }
-}
-
-# ============================================================================
-# STEP 6 - KNIX SERVICE DESK SHORTCUT
+# STEP 5 - KNIX SERVICE DESK SHORTCUT
 # Get-LocalUser is gone - it needs the LocalAccounts module and throws on some
 # builds. Profile folders are enumerated directly instead.
 # ============================================================================
@@ -2503,7 +2199,7 @@ IconIndex=160
 }
 
 # ============================================================================
-# STEP 7 - CORPORATE WALLPAPER
+# STEP 6 - CORPORATE WALLPAPER
 # ============================================================================
 
 Invoke-Step -Name 'Wallpaper' -Body {
@@ -2642,7 +2338,7 @@ public class KnixWallpaper {
 }
 
 # ============================================================================
-# STEP 8 - BITLOCKER
+# STEP 7 - BITLOCKER
 # Last on purpose, and it NEVER reboots unless -AllowReboot is passed. The old
 # script's "shutdown /r /t 60" is what killed the rest of the Atera chain.
 # ============================================================================
