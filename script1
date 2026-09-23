@@ -729,7 +729,9 @@ function Invoke-Download {
 function Test-InstallerSignature {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string]$ExpectedSubject
+        # Several accepted publishers - vendors get acquired and re-sign under
+        # the new parent's name (Slack now signs as Salesforce, for instance).
+        [string[]]$ExpectedSubject = @()
     )
 
     $name = Split-Path $Path -Leaf
@@ -744,24 +746,76 @@ function Test-InstallerSignature {
 
     $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
 
+    $publisherOk = $true
+    if ($ExpectedSubject.Count -gt 0) {
+        $publisherOk = $false
+        foreach ($expected in $ExpectedSubject) {
+            if ($subject -like "*$expected*") { $publisherOk = $true; break }
+        }
+    }
+
     if ($sig.Status -eq 'Valid') {
         Write-Log "Signature valid: $subject"
-        if ($ExpectedSubject -and $subject -notlike "*$ExpectedSubject*") {
-            Write-Log "Signed, but by an unexpected publisher (expected *$ExpectedSubject*)." 'ERROR'
+        if (-not $publisherOk) {
+            Write-Log "Signed, but by an unexpected publisher. Expected one of: $($ExpectedSubject -join ', ')" 'ERROR'
             return $false
         }
         return $true
     }
 
     # Chain could not be evaluated - tolerated only with a matching publisher.
-    if ($sig.Status -eq 'UnknownError' -and $ExpectedSubject -and $subject -like "*$ExpectedSubject*") {
-        Write-Log "$name : chain could not be validated (status UnknownError) but it is signed by $subject - accepting." 'WARN'
+    if ($sig.Status -eq 'UnknownError' -and $publisherOk -and $subject) {
+        Write-Log "$name : chain could not be validated (UnknownError) but it is signed by $subject - accepting." 'WARN'
         Write-Log 'If this keeps happening, the image is missing root certificate updates.' 'WARN'
         return $true
     }
 
     Write-Log "Signature check FAILED for $name : status=$($sig.Status) signer=$subject" 'ERROR'
     return $false
+}
+
+<#
+    Works out a working Slack machine-wide MSI URL.
+
+    Slack has no stable "latest MSI" link - the old slack.com/ssb/download-win64-msi
+    redirect now 404s, which is exactly why Slack stopped installing - and MSI
+    builds are published for only SOME versions, lagging the app releases. So
+    the release feed is read and candidate URLs are probed with a HEAD request
+    until one answers 200.
+#>
+function Get-SlackMsiUrl {
+
+    $pinned = 'https://downloads.slack-edge.com/desktop-releases/windows/x64/4.48.102/slack-standalone-4.48.102.0.msi'
+    $candidates = @()
+
+    try {
+        $rss = Invoke-WebRequest -Uri 'https://slack.com/release-notes/windows/rss' -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        $versions = [regex]::Matches($rss.Content, '\b(\d+\.\d+\.\d+)\b') | ForEach-Object { $_.Groups[1].Value }
+        $versions = @($versions | Select-Object -Unique | Select-Object -First 15)
+        Write-Log "Slack release feed returned $($versions.Count) candidate version(s)."
+        foreach ($v in $versions) {
+            $candidates += "https://downloads.slack-edge.com/desktop-releases/windows/x64/$v/slack-standalone-$v.0.msi"
+        }
+    }
+    catch {
+        Write-Log "Could not read the Slack release feed: $($_.Exception.Message)" 'WARN'
+    }
+
+    $candidates += $pinned
+
+    foreach ($u in $candidates) {
+        try {
+            $r = Invoke-WebRequest -Uri $u -Method Head -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+            if ($r.StatusCode -eq 200) {
+                Write-Log "Slack MSI available: $u" 'SUCCESS'
+                return $u
+            }
+        }
+        catch { }   # 404 for versions with no MSI build - expected, keep probing
+    }
+
+    Write-Log 'No Slack MSI URL responded - falling back to the pinned version.' 'WARN'
+    return $pinned
 }
 
 <#
@@ -1849,6 +1903,9 @@ Invoke-Step -Name 'Splashtop' -Body {
 
 Invoke-Step -Name 'CoreApps' -Body {
 
+    # Slack's MSI URL has to be discovered - see Get-SlackMsiUrl.
+    $slackMsiUrl = Get-SlackMsiUrl
+
     $apps = @(
         [pscustomobject]@{
             Name      = 'Google Chrome'
@@ -1862,7 +1919,7 @@ Invoke-Step -Name 'CoreApps' -Body {
             File      = 'chrome_enterprise.msi'
             Kind      = 'msi'
             MinBytes  = 40MB
-            Publisher = 'Google LLC'
+            Publisher = @('Google LLC','Google Inc')
             Args      = @()
             Detect    = {
                 (Test-Path 'C:\Program Files\Google\Chrome\Application\chrome.exe') -or
@@ -1872,14 +1929,11 @@ Invoke-Step -Name 'CoreApps' -Body {
         },
         [pscustomobject]@{
             Name      = 'Slack'
-            Urls      = @(
-                'https://slack.com/ssb/download-win64-msi',
-                'https://downloads.slack-edge.com/desktop-releases/windows/x64/slack-standalone-latest.msi'
-            )
+            Urls      = @($slackMsiUrl)
             File      = 'slack_machine_wide.msi'
             Kind      = 'msi'
-            MinBytes  = 20MB
-            Publisher = 'Slack Technologies'
+            MinBytes  = 10MB
+            Publisher = @('Slack Technologies','Salesforce')
             Args      = @()
             Detect    = {
                 # Slack installs per-user by default, so a machine-hive-only
@@ -1899,7 +1953,7 @@ Invoke-Step -Name 'CoreApps' -Body {
             File      = 'GoogleDriveSetup.exe'
             Kind      = 'exe'
             MinBytes  = 15MB
-            Publisher = 'Google LLC'
+            Publisher = @('Google LLC','Google Inc')
             Args      = @('--silent','--gsuite_shortcuts=false')
             Detect    = {
                 (Test-Path 'C:\Program Files\Google\Drive File Stream') -and
