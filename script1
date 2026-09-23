@@ -86,6 +86,21 @@ param(
     # NOT a secret - safe to commit. Can also come from KNIX_SLACK_CHANNEL.
     [string]$SlackChannel = '',
 
+    # ------------------------------------------------------------------------
+    # BITLOCKER KEY ESCROW -> GOOGLE SHEET
+    #
+    # Deploy Knix-BitLocker-Sheet.gs as an Apps Script web app bound to the
+    # sheet, then put its /exec URL and the shared secret in the BOOTSTRAP (in
+    # Atera), not here - the bootstrap sets KNIX_SHEET_URL / KNIX_SHEET_SECRET
+    # and this script picks them up, so neither reaches GitHub.
+    #
+    # The endpoint only writes. It cannot read the sheet back, so a device that
+    # gets compromised cannot enumerate everyone else's recovery keys.
+    # ------------------------------------------------------------------------
+    [string]$BitLockerSheetUrl = '',
+
+    [string]$BitLockerSheetSecret = '',
+
     # Optional mention prepended to failure alerts only.
     # Examples: '<!channel>'  '<!here>'  '<@U01ABCDEFGH>'  '<!subteam^S01ABC|@it-team>'
     [string]$SlackMention = '',
@@ -156,6 +171,12 @@ if ([string]::IsNullOrWhiteSpace($SlackBotToken) -and $env:KNIX_SLACK_TOKEN) {
 }
 if ([string]::IsNullOrWhiteSpace($SlackChannel) -and $env:KNIX_SLACK_CHANNEL) {
     $SlackChannel = $env:KNIX_SLACK_CHANNEL
+}
+if ([string]::IsNullOrWhiteSpace($BitLockerSheetUrl) -and $env:KNIX_SHEET_URL) {
+    $BitLockerSheetUrl = $env:KNIX_SHEET_URL
+}
+if ([string]::IsNullOrWhiteSpace($BitLockerSheetSecret) -and $env:KNIX_SHEET_SECRET) {
+    $BitLockerSheetSecret = $env:KNIX_SHEET_SECRET
 }
 
 # ============================================================================
@@ -1349,6 +1370,137 @@ function Test-PendingReboot {
     return [bool]$pfro.PendingFileRenameOperations
 }
 
+# ----------------------------------------------------------------------------
+# SPLASHTOP
+# ----------------------------------------------------------------------------
+
+$Script:SplashtopRegPaths = @(
+    'HKLM:\SOFTWARE\WOW6432Node\Splashtop Inc.\Splashtop Remote Server',
+    'HKLM:\SOFTWARE\Splashtop Inc.\Splashtop Remote Server'
+)
+
+$Script:SplashtopFolders = @(
+    'C:\Program Files (x86)\Splashtop\Splashtop Remote\Server',
+    'C:\Program Files\Splashtop\Splashtop Remote\Server'
+)
+
+function Test-SplashtopInstalled {
+    foreach ($p in $Script:SplashtopRegPaths) { if (Test-Path $p) { return $true } }
+    foreach ($f in $Script:SplashtopFolders)  { if (Test-Path $f) { return $true } }
+    return $false
+}
+
+<#
+    Is the team deployment code ACTUALLY applied to this Streamer?
+
+    Evidence only - no state markers.
+
+    An earlier version of this script also accepted a marker file that the
+    script itself wrote after a successful INSTALL, which is not the same thing
+    as the code having been applied. That made the check self-certifying: every
+    run after the first read its own marker, reported "already enrolled", and
+    silently left Streamers sitting there without their deployment code. That
+    is the bug that let an unconfigured Streamer through.
+
+    Value names differ between Streamer builds, so rather than guessing a name
+    this walks the whole Splashtop key tree for any value whose DATA is the
+    deployment code, then falls back to scanning the config files.
+#>
+function Test-SplashtopDeployCode {
+    param([Parameter(Mandatory)][string]$Code)
+
+    foreach ($p in $Script:SplashtopRegPaths) {
+
+        if (-not (Test-Path $p)) { continue }
+
+        $keys = @()
+        $keys += @(Get-Item -Path $p -ErrorAction SilentlyContinue)
+        $keys += @(Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue)
+
+        foreach ($k in $keys) {
+            if (-not $k) { continue }
+            try { $names = $k.GetValueNames() } catch { continue }
+            foreach ($valueName in $names) {
+                try { $data = "$($k.GetValue($valueName))" } catch { continue }
+                if ($data -eq $Code) {
+                    Write-Log "Deployment code found in registry: $($k.Name) -> $valueName" 'SUCCESS'
+                    return $true
+                }
+            }
+        }
+    }
+
+    foreach ($f in $Script:SplashtopFolders) {
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $hit = Get-ChildItem -Path $f -Include '*.ini','*.xml','*.cfg','*.json','*.txt' -Recurse -File -ErrorAction SilentlyContinue | Select-String -SimpleMatch -Pattern $Code -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) {
+                Write-Log "Deployment code found in config file: $($hit.Path)" 'SUCCESS'
+                return $true
+            }
+        } catch { }
+    }
+
+    return $false
+}
+
+<#
+    Sends a BitLocker recovery key to the Google Sheet escrow.
+
+    The endpoint is an Apps Script web app that ONLY appends/updates rows - it
+    cannot read the sheet back - so a compromised laptop cannot enumerate other
+    devices' keys. See Knix-BitLocker-Sheet.gs for the code to deploy.
+
+    URL and secret come from the environment (KNIX_SHEET_URL / KNIX_SHEET_SECRET)
+    so neither is ever committed to the repo.
+#>
+function Send-BitLockerKeyToSheet {
+    param(
+        [Parameter(Mandatory)][string]$Computer,
+        [Parameter(Mandatory)][string]$Serial,
+        [Parameter(Mandatory)][string]$RecoveryKey,
+        [string]$KeyId = '',
+        [int]$TimeoutSec = 30
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BitLockerSheetUrl)) {
+        Write-Log 'No BitLocker sheet URL configured - skipping escrow to Google Sheets.'
+        return $false
+    }
+
+    $payload = @{
+        secret   = $BitLockerSheetSecret
+        computer = $Computer
+        serial   = $Serial
+        key      = $RecoveryKey
+        keyId    = $KeyId
+    }
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $body = $payload | ConvertTo-Json -Compress
+            $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+
+            $response = Invoke-RestMethod -Uri $BitLockerSheetUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+
+            if ($response.ok) {
+                Write-Log "Recovery key escrowed to the Google Sheet ($($response.action))." 'SUCCESS'
+                return $true
+            }
+
+            Write-Log "Sheet endpoint rejected the write: $($response.error)" 'WARN'
+            return $false
+        }
+        catch {
+            Write-Log "Sheet escrow attempt $attempt failed: $($_.Exception.Message)" 'WARN'
+            Start-Sleep -Seconds (3 * $attempt)
+        }
+    }
+
+    Write-Log 'Could not escrow the recovery key to the Google Sheet.' 'ERROR'
+    return $false
+}
+
 <#
     Post-flight verification.
 
@@ -1387,39 +1539,15 @@ function Get-DeviceHealth {
             Add-HealthCheck 'Splashtop' 'SKIPPED' 'skipped by parameter'
         }
         else {
-            $regPaths = @(
-                'HKLM:\SOFTWARE\WOW6432Node\Splashtop Inc.\Splashtop Remote Server',
-                'HKLM:\SOFTWARE\Splashtop Inc.\Splashtop Remote Server'
-            )
-            $present = $false
-            foreach ($p in $regPaths) { if (Test-Path $p) { $present = $true } }
-            foreach ($f in @('C:\Program Files (x86)\Splashtop\Splashtop Remote\Server',
-                             'C:\Program Files\Splashtop\Splashtop Remote\Server')) {
-                if (Test-Path $f) { $present = $true }
-            }
-
-            $enrolled = $false
-            foreach ($p in $regPaths) {
-                if (-not (Test-Path $p)) { continue }
-                $props = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
-                if (-not $props) { continue }
-                foreach ($prop in $props.PSObject.Properties) {
-                    if ($prop.Name -like 'PS*') { continue }
-                    if ("$($prop.Value)" -eq $SplashtopDeployCode) { $enrolled = $true }
-                }
-            }
-            $marker = Join-Path $Script:StateDir 'splashtop.dcode'
-            if (-not $enrolled -and (Test-Path $marker)) {
-                if ((Get-Content $marker -Raw -ErrorAction SilentlyContinue).Trim() -eq $SplashtopDeployCode) { $enrolled = $true }
-            }
-
-            $running = [bool](Get-Service -ErrorAction SilentlyContinue |
-                       Where-Object { $_.DisplayName -like '*Splashtop*' -and $_.Status -eq 'Running' })
+            $present  = Test-SplashtopInstalled
+            $enrolled = if ($present) { Test-SplashtopDeployCode -Code $SplashtopDeployCode } else { $false }
+            $running  = [bool](Get-Service -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like '*Splashtop*' -and $_.Status -eq 'Running' })
 
             if     (-not $present)  { Add-HealthCheck 'Splashtop' $false 'not installed' }
-            elseif (-not $enrolled) { Add-HealthCheck 'Splashtop' $false 'installed but deployment code not applied' }
-            elseif (-not $running)  { Add-HealthCheck 'Splashtop' $false 'enrolled but service not running' }
-            else                    { Add-HealthCheck 'Splashtop' $true  'installed, enrolled, service running' }
+            elseif (-not $enrolled) { Add-HealthCheck 'Splashtop' $false "deployment code $SplashtopDeployCode NOT applied" }
+            elseif (-not $running)  { Add-HealthCheck 'Splashtop' $false 'deploy code applied but service not running' }
+            else                    { Add-HealthCheck 'Splashtop' $true  "installed, deploy code $SplashtopDeployCode applied, service running" }
         }
     } catch { Add-HealthCheck 'Splashtop' $false "check error: $($_.Exception.Message)" }
 
@@ -1752,51 +1880,9 @@ Invoke-Step -Name 'Malwarebytes' -Body {
 
 Invoke-Step -Name 'Splashtop' -Body {
 
-    $regPaths = @(
-        'HKLM:\SOFTWARE\WOW6432Node\Splashtop Inc.\Splashtop Remote Server',
-        'HKLM:\SOFTWARE\Splashtop Inc.\Splashtop Remote Server'
-    )
-    $folders = @(
-        'C:\Program Files (x86)\Splashtop\Splashtop Remote\Server',
-        'C:\Program Files\Splashtop\Splashtop Remote\Server'
-    )
-    $markerFile = Join-Path $Script:StateDir 'splashtop.dcode'
-
-    function Test-SplashtopInstalled {
-        foreach ($p in $regPaths) { if (Test-Path $p) { return $true } }
-        foreach ($f in $folders)  { if (Test-Path $f) { return $true } }
-        return $false
-    }
-
-    function Test-SplashtopEnrolled {
-        # Primary signal: any value under the Splashtop key whose data matches
-        # the deployment code. Value names differ between Streamer versions, so
-        # match on the data rather than guessing a name.
-        foreach ($p in $regPaths) {
-            if (-not (Test-Path $p)) { continue }
-            $props = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
-            if (-not $props) { continue }
-            foreach ($prop in $props.PSObject.Properties) {
-                if ($prop.Name -like 'PS*') { continue }
-                if ("$($prop.Value)" -eq $SplashtopDeployCode) {
-                    Write-Log "Deployment code found in registry value '$($prop.Name)'."
-                    return $true
-                }
-            }
-        }
-        # Secondary signal: our own marker from a previous successful run.
-        if (Test-Path $markerFile) {
-            $recorded = (Get-Content $markerFile -Raw -ErrorAction SilentlyContinue).Trim()
-            if ($recorded -eq $SplashtopDeployCode) {
-                Write-Log 'Deployment code previously applied (state marker present).'
-                return $true
-            }
-        }
-        return $false
-    }
 
     $isInstalled = Test-SplashtopInstalled
-    $isEnrolled  = if ($isInstalled) { Test-SplashtopEnrolled } else { $false }
+    $isEnrolled  = if ($isInstalled) { Test-SplashtopDeployCode -Code $SplashtopDeployCode } else { $false }
 
     if ($isInstalled -and $isEnrolled) {
         $svc = Get-Service -ErrorAction SilentlyContinue |
@@ -1879,9 +1965,8 @@ Invoke-Step -Name 'Splashtop' -Body {
         return @{ Status = 'FAILED'; Detail = 'Installer succeeded but Streamer not detected' }
     }
 
-    Set-Content -Path $markerFile -Value $SplashtopDeployCode -Encoding ASCII -Force -ErrorAction SilentlyContinue
 
-    $enrolled = Test-SplashtopEnrolled
+    $enrolled = Test-SplashtopDeployCode -Code $SplashtopDeployCode
     $svcFound = Get-Service -ErrorAction SilentlyContinue |
                 Where-Object { $_.DisplayName -like '*Splashtop*' }
     foreach ($s in $svcFound) { Write-Log "Splashtop service: $($s.DisplayName) [$($s.Status)]" }
@@ -2539,8 +2624,24 @@ Invoke-Step -Name 'BitLocker' -Body {
         }
         catch { Write-Log "Could not write the local recovery key file: $($_.Exception.Message)" 'WARN' }
 
-        # Surfaced in Atera output so it is captured centrally.
-        Write-Log "BITLOCKER RECOVERY KEY ($env:COMPUTERNAME): $($rp.RecoveryPassword)"
+        # --- Escrow to the Google Sheet -------------------------------------
+        $serial = 'unknown'
+        try {
+            $serial = "$((Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber)".Trim()
+        } catch { }
+
+        $escrowed = Send-BitLockerKeyToSheet -Computer $env:COMPUTERNAME -Serial $serial -RecoveryKey $rp.RecoveryPassword -KeyId "$($rp.KeyProtectorId)"
+
+        if ($escrowed) {
+            $actions += 'key escrowed to Google Sheet'
+            # Safely stored, so the key itself stays out of Atera's run history.
+            Write-Log "Recovery key for $env:COMPUTERNAME (serial $serial) is in the Google Sheet. Key ID: $($rp.KeyProtectorId)"
+        }
+        else {
+            # Nowhere else to put it - print it so it is not lost, and say so.
+            Write-Log 'Sheet escrow unavailable - printing the key to this output instead.' 'WARN'
+            Write-Log "BITLOCKER RECOVERY KEY ($env:COMPUTERNAME / $serial): $($rp.RecoveryPassword)"
+        }
 
         # Old script's insecure drop on the root of C:.
         if (Test-Path 'C:\BitLocker_RecoveryKey.txt') {
