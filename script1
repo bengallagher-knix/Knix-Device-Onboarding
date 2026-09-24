@@ -101,6 +101,12 @@ param(
 
     [string]$BitLockerSheetSecret = '',
 
+    # Windows account whose Documents folder gets the local copy of the
+    # BitLocker recovery key. Resolved via the profile list, so it still works
+    # when the profile FOLDER name differs from the account name (it usually
+    # does - "Knix Admin" commonly lands in C:\Users\knixadmin).
+    [string]$KeyFileAccount = 'Knix Admin',
+
     # Optional mention prepended to failure alerts only.
     # Examples: '<!channel>'  '<!here>'  '<@U01ABCDEFGH>'  '<!subteam^S01ABC|@it-team>'
     [string]$SlackMention = '',
@@ -1360,6 +1366,51 @@ function Wait-ForMsiIdle {
     return $false
 }
 
+<#
+    Resolves an account name to its Documents folder.
+
+    Windows profile folder names rarely match the account name - "Knix Admin"
+    typically becomes C:\Users\knixadmin, and a re-created profile can become
+    knixadmin.KNIX-PC or knixadmin.000. So the SID is looked up first and the
+    real path read from ProfileList, with folder-name guessing only as backup.
+
+    Returns $null when the account has no profile on this device yet.
+#>
+function Get-UserDocumentsPath {
+    param([Parameter(Mandatory)][string]$AccountName)
+
+    # 1. Account name -> SID -> ProfileImagePath. Authoritative.
+    try {
+        $sid = (New-Object System.Security.Principal.NTAccount($AccountName)).Translate(
+                   [System.Security.Principal.SecurityIdentifier]).Value
+        $profilePath = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath
+        if ($profilePath -and (Test-Path $profilePath)) {
+            Write-Log "Resolved '$AccountName' to profile $profilePath"
+            return (Join-Path $profilePath 'Documents')
+        }
+    }
+    catch { }
+
+    $root = Split-Path $env:PUBLIC -Parent
+    if (-not (Test-Path $root)) { $root = 'C:\Users' }
+
+    # 2. Exact folder name.
+    $direct = Join-Path $root $AccountName
+    if (Test-Path $direct) { return (Join-Path $direct 'Documents') }
+
+    # 3. Ignore spaces, punctuation and case: "Knix Admin" -> "knixadmin".
+    $squashed = ($AccountName -replace '[^A-Za-z0-9]', '').ToLower()
+    $match = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+             Where-Object { ($_.Name -replace '[^A-Za-z0-9]', '').ToLower() -eq $squashed } |
+             Select-Object -First 1
+    if ($match) {
+        Write-Log "Matched '$AccountName' to profile folder $($match.FullName)"
+        return (Join-Path $match.FullName 'Documents')
+    }
+
+    return $null
+}
+
 function Test-PendingReboot {
     $paths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
@@ -1476,11 +1527,17 @@ function Send-BitLockerKeyToSheet {
         keyId    = $KeyId
     }
 
+    if ($BitLockerSheetUrl -match '/dev\s*$') {
+        Write-Log 'The sheet URL ends in /dev - that is the Apps Script TEST deployment and always requires a signed-in owner.' 'ERROR'
+        Write-Log 'Use the /exec URL from Deploy > Manage deployments instead.' 'ERROR'
+        return $false
+    }
+
+    $body  = $payload | ConvertTo-Json -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            $body = $payload | ConvertTo-Json -Compress
-            $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-
             $response = Invoke-RestMethod -Uri $BitLockerSheetUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
 
             if ($response.ok) {
@@ -1492,7 +1549,41 @@ function Send-BitLockerKeyToSheet {
             return $false
         }
         catch {
-            Write-Log "Sheet escrow attempt $attempt failed: $($_.Exception.Message)" 'WARN'
+            # Pull the real status code and body out of the exception - the
+            # default message alone does not say whether this is an auth
+            # problem, a bad secret, or the script erroring.
+            $status = $null
+            $respBody = ''
+            try {
+                $webResp = $_.Exception.Response
+                if ($webResp) {
+                    $status = [int]$webResp.StatusCode
+                    $reader = New-Object System.IO.StreamReader($webResp.GetResponseStream())
+                    $respBody = $reader.ReadToEnd()
+                    $reader.Close()
+                }
+            } catch { }
+
+            Write-Log "Sheet escrow attempt $attempt failed (HTTP $status): $($_.Exception.Message)" 'WARN'
+
+            if ($respBody) {
+                $snippet = $respBody.Substring(0, [Math]::Min(300, $respBody.Length)) -replace '\s+', ' '
+                Write-Log "  response body: $snippet"
+            }
+
+            # 401/403 is a publishing problem. Retrying cannot fix it, so stop
+            # and print the exact remedy rather than failing three times.
+            if ($status -eq 401 -or $status -eq 403) {
+                Write-Log 'HTTP 401/403 - the Apps Script web app is not published for anonymous access.' 'ERROR'
+                Write-Log 'FIX 1: Apps Script > Deploy > Manage deployments > edit (pencil) >' 'ERROR'
+                Write-Log '       Execute as = Me,  Who has access = Anyone   (NOT "Anyone with Google account")' 'ERROR'
+                Write-Log '       then Version = New version > Deploy. Settings changes need a NEW VERSION to take effect.' 'ERROR'
+                Write-Log 'FIX 2: make sure the URL is the /exec one, not /dev.' 'ERROR'
+                Write-Log 'FIX 3: if "Anyone" is missing or ignored, your Workspace admin blocks anonymous' 'ERROR'
+                Write-Log '       Apps Script web apps - that policy has to be relaxed for this to work.' 'ERROR'
+                return $false
+            }
+
             Start-Sleep -Seconds (3 * $attempt)
         }
     }
@@ -1782,6 +1873,32 @@ Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name
 Write-Log "PowerShell: $($PSVersionTable.PSVersion) | 64-bit process: $([Environment]::Is64BitProcess)"
 Write-Log "OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
 Write-Log '############################################################'
+
+# ----------------------------------------------------------------------------
+# LOCK DOWN C:\ProgramData\Knix
+#
+# This tree is not safe for standard users to read:
+#   * Onboarding.log receives the BitLocker recovery key whenever the Google
+#     Sheet escrow is unavailable and the key has to be printed instead.
+#   * The verbose MSI logs contain installer properties, including the
+#     Malwarebytes NEBULA_ACCOUNTTOKEN.
+# ProgramData grants Users read by default, so inheritance is removed here and
+# access cut to SYSTEM and Administrators.
+# ----------------------------------------------------------------------------
+try {
+    $rootAcl = Get-Acl -Path $Script:Root
+    $rootAcl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($rootAcl.Access)) { [void]$rootAcl.RemoveAccessRule($rule) }
+    foreach ($who in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
+        $rootAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $who, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    Set-Acl -Path $Script:Root -AclObject $rootAcl
+    Write-Log "$Script:Root restricted to SYSTEM and Administrators."
+}
+catch {
+    Write-Log "Could not restrict permissions on $Script:Root : $($_.Exception.Message)" 'WARN'
+}
 
 if (Test-SlackConfigured) {
     Write-Log "Slack alerting enabled (channel: $SlackChannel, mode: $SlackNotify)."
@@ -2606,23 +2723,36 @@ Invoke-Step -Name 'BitLocker' -Body {
             Write-Log 'Device is not Entra ID joined - no cloud escrow performed.' 'WARN'
         }
 
-        # Local copy, restricted to SYSTEM + Administrators.
-        $keyFile = Join-Path $Script:StateDir 'BitLocker-RecoveryKey.txt'
+        # --- Local copy in the IT admin account's Documents folder ----------
+        $docs = Get-UserDocumentsPath -AccountName $KeyFileAccount
+
+        if (-not $docs) {
+            Write-Log "No profile found for '$KeyFileAccount' - that account has probably never signed in on this device." 'WARN'
+            $docs = $Script:StateDir
+            Write-Log "Writing the local key copy to $docs instead." 'WARN'
+        }
+
         try {
+            if (-not (Test-Path $docs)) {
+                New-Item -Path $docs -ItemType Directory -Force | Out-Null
+            }
+
+            $keyFile = Join-Path $docs 'BitLocker-RecoveryKey.txt'
+
             "Computer : $env:COMPUTERNAME`r`nSaved    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nKeyID    : $($rp.KeyProtectorId)`r`nKey      : $($rp.RecoveryPassword)" |
                 Out-File -FilePath $keyFile -Encoding ASCII -Force
 
-            $acl = Get-Acl $keyFile
-            $acl.SetAccessRuleProtection($true, $false)
-            $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
-            foreach ($who in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
-                $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
-                    $who,'FullControl','Allow')))
-            }
-            Set-Acl -Path $keyFile -AclObject $acl
-            Write-Log "Recovery key written to $keyFile (SYSTEM/Administrators only)."
+            Write-Log "Recovery key written to $keyFile" 'SUCCESS'
         }
         catch { Write-Log "Could not write the local recovery key file: $($_.Exception.Message)" 'WARN' }
+
+        # Tidy up copies left by earlier versions of this script.
+        foreach ($stale in @('C:\BitLocker_RecoveryKey.txt', (Join-Path $Script:StateDir 'BitLocker-RecoveryKey.txt'))) {
+            if ((Test-Path $stale) -and ($stale -ne $keyFile)) {
+                Remove-Item $stale -Force -ErrorAction SilentlyContinue
+                Write-Log "Removed old key copy at $stale"
+            }
+        }
 
         # --- Escrow to the Google Sheet -------------------------------------
         $serial = 'unknown'
