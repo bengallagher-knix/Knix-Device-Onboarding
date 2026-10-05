@@ -86,21 +86,6 @@ param(
     # NOT a secret - safe to commit. Can also come from KNIX_SLACK_CHANNEL.
     [string]$SlackChannel = '',
 
-    # ------------------------------------------------------------------------
-    # BITLOCKER KEY ESCROW -> GOOGLE SHEET
-    #
-    # Deploy Knix-BitLocker-Sheet.gs as an Apps Script web app bound to the
-    # sheet, then put its /exec URL and the shared secret in the BOOTSTRAP (in
-    # Atera), not here - the bootstrap sets KNIX_SHEET_URL / KNIX_SHEET_SECRET
-    # and this script picks them up, so neither reaches GitHub.
-    #
-    # The endpoint only writes. It cannot read the sheet back, so a device that
-    # gets compromised cannot enumerate everyone else's recovery keys.
-    # ------------------------------------------------------------------------
-    [string]$BitLockerSheetUrl = '',
-
-    [string]$BitLockerSheetSecret = '',
-
     # Windows account whose Documents folder gets the local copy of the
     # BitLocker recovery key. Resolved via the profile list, so it still works
     # when the profile FOLDER name differs from the account name (it usually
@@ -177,12 +162,6 @@ if ([string]::IsNullOrWhiteSpace($SlackBotToken) -and $env:KNIX_SLACK_TOKEN) {
 }
 if ([string]::IsNullOrWhiteSpace($SlackChannel) -and $env:KNIX_SLACK_CHANNEL) {
     $SlackChannel = $env:KNIX_SLACK_CHANNEL
-}
-if ([string]::IsNullOrWhiteSpace($BitLockerSheetUrl) -and $env:KNIX_SHEET_URL) {
-    $BitLockerSheetUrl = $env:KNIX_SHEET_URL
-}
-if ([string]::IsNullOrWhiteSpace($BitLockerSheetSecret) -and $env:KNIX_SHEET_SECRET) {
-    $BitLockerSheetSecret = $env:KNIX_SHEET_SECRET
 }
 
 # ============================================================================
@@ -1495,102 +1474,6 @@ function Test-SplashtopDeployCode {
     return $false
 }
 
-<#
-    Sends a BitLocker recovery key to the Google Sheet escrow.
-
-    The endpoint is an Apps Script web app that ONLY appends/updates rows - it
-    cannot read the sheet back - so a compromised laptop cannot enumerate other
-    devices' keys. See Knix-BitLocker-Sheet.gs for the code to deploy.
-
-    URL and secret come from the environment (KNIX_SHEET_URL / KNIX_SHEET_SECRET)
-    so neither is ever committed to the repo.
-#>
-function Send-BitLockerKeyToSheet {
-    param(
-        [Parameter(Mandatory)][string]$Computer,
-        [Parameter(Mandatory)][string]$Serial,
-        [Parameter(Mandatory)][string]$RecoveryKey,
-        [string]$KeyId = '',
-        [int]$TimeoutSec = 30
-    )
-
-    if ([string]::IsNullOrWhiteSpace($BitLockerSheetUrl)) {
-        Write-Log 'No BitLocker sheet URL configured - skipping escrow to Google Sheets.'
-        return $false
-    }
-
-    $payload = @{
-        secret   = $BitLockerSheetSecret
-        computer = $Computer
-        serial   = $Serial
-        key      = $RecoveryKey
-        keyId    = $KeyId
-    }
-
-    if ($BitLockerSheetUrl -match '/dev\s*$') {
-        Write-Log 'The sheet URL ends in /dev - that is the Apps Script TEST deployment and always requires a signed-in owner.' 'ERROR'
-        Write-Log 'Use the /exec URL from Deploy > Manage deployments instead.' 'ERROR'
-        return $false
-    }
-
-    $body  = $payload | ConvertTo-Json -Compress
-    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        try {
-            $response = Invoke-RestMethod -Uri $BitLockerSheetUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
-
-            if ($response.ok) {
-                Write-Log "Recovery key escrowed to the Google Sheet ($($response.action))." 'SUCCESS'
-                return $true
-            }
-
-            Write-Log "Sheet endpoint rejected the write: $($response.error)" 'WARN'
-            return $false
-        }
-        catch {
-            # Pull the real status code and body out of the exception - the
-            # default message alone does not say whether this is an auth
-            # problem, a bad secret, or the script erroring.
-            $status = $null
-            $respBody = ''
-            try {
-                $webResp = $_.Exception.Response
-                if ($webResp) {
-                    $status = [int]$webResp.StatusCode
-                    $reader = New-Object System.IO.StreamReader($webResp.GetResponseStream())
-                    $respBody = $reader.ReadToEnd()
-                    $reader.Close()
-                }
-            } catch { }
-
-            Write-Log "Sheet escrow attempt $attempt failed (HTTP $status): $($_.Exception.Message)" 'WARN'
-
-            if ($respBody) {
-                $snippet = $respBody.Substring(0, [Math]::Min(300, $respBody.Length)) -replace '\s+', ' '
-                Write-Log "  response body: $snippet"
-            }
-
-            # 401/403 is a publishing problem. Retrying cannot fix it, so stop
-            # and print the exact remedy rather than failing three times.
-            if ($status -eq 401 -or $status -eq 403) {
-                Write-Log 'HTTP 401/403 - the Apps Script web app is not published for anonymous access.' 'ERROR'
-                Write-Log 'FIX 1: Apps Script > Deploy > Manage deployments > edit (pencil) >' 'ERROR'
-                Write-Log '       Execute as = Me,  Who has access = Anyone   (NOT "Anyone with Google account")' 'ERROR'
-                Write-Log '       then Version = New version > Deploy. Settings changes need a NEW VERSION to take effect.' 'ERROR'
-                Write-Log 'FIX 2: make sure the URL is the /exec one, not /dev.' 'ERROR'
-                Write-Log 'FIX 3: if "Anyone" is missing or ignored, your Workspace admin blocks anonymous' 'ERROR'
-                Write-Log '       Apps Script web apps - that policy has to be relaxed for this to work.' 'ERROR'
-                return $false
-            }
-
-            Start-Sleep -Seconds (3 * $attempt)
-        }
-    }
-
-    Write-Log 'Could not escrow the recovery key to the Google Sheet.' 'ERROR'
-    return $false
-}
 
 <#
     Post-flight verification.
@@ -1879,7 +1762,7 @@ Write-Log '############################################################'
 #
 # This tree is not safe for standard users to read:
 #   * Onboarding.log receives the BitLocker recovery key whenever the Google
-#     Sheet escrow is unavailable and the key has to be printed instead.
+#     the key file cannot be written and the key has to be printed instead.
 #   * The verbose MSI logs contain installer properties, including the
 #     Malwarebytes NEBULA_ACCOUNTTOKEN.
 # ProgramData grants Users read by default, so inheritance is removed here and
@@ -2698,7 +2581,7 @@ Invoke-Step -Name 'BitLocker' -Body {
     Start-Sleep -Seconds 5
     $final = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction SilentlyContinue
 
-    # --- Recovery key: escrow first, file second ---------------------------
+    # --- Recovery key: Entra escrow, then the local file --------------------
     $rp = $final.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
 
     if ($rp -and $rp.RecoveryPassword) {
@@ -2732,46 +2615,43 @@ Invoke-Step -Name 'BitLocker' -Body {
             Write-Log "Writing the local key copy to $docs instead." 'WARN'
         }
 
+        $keyFile = $null
+        $keyFileWritten = $false
+
         try {
             if (-not (Test-Path $docs)) {
                 New-Item -Path $docs -ItemType Directory -Force | Out-Null
             }
 
-            $keyFile = Join-Path $docs 'BitLocker-RecoveryKey.txt'
+            $keyFile = Join-Path $docs 'blk.txt'
 
             "Computer : $env:COMPUTERNAME`r`nSaved    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nKeyID    : $($rp.KeyProtectorId)`r`nKey      : $($rp.RecoveryPassword)" |
                 Out-File -FilePath $keyFile -Encoding ASCII -Force
 
-            Write-Log "Recovery key written to $keyFile" 'SUCCESS'
+            if (Test-Path $keyFile) {
+                $keyFileWritten = $true
+                $actions += 'key saved to blk.txt'
+                Write-Log "Recovery key written to $keyFile" 'SUCCESS'
+            }
         }
         catch { Write-Log "Could not write the local recovery key file: $($_.Exception.Message)" 'WARN' }
 
+        if (-not $keyFileWritten) {
+            # The file is the only copy now, so if it could not be written the
+            # key must go somewhere. Printing it puts it in Atera's run history,
+            # which is not ideal - but losing it entirely is worse.
+            Write-Log 'Key file could not be written - printing the key to this output instead.' 'WARN'
+            Write-Log "BITLOCKER RECOVERY KEY ($env:COMPUTERNAME): $($rp.RecoveryPassword)"
+        }
+
         # Tidy up copies left by earlier versions of this script.
-        foreach ($stale in @('C:\BitLocker_RecoveryKey.txt', (Join-Path $Script:StateDir 'BitLocker-RecoveryKey.txt'))) {
+        foreach ($stale in @('C:\BitLocker_RecoveryKey.txt', (Join-Path $Script:StateDir 'BitLocker-RecoveryKey.txt'), (Join-Path $docs 'BitLocker-RecoveryKey.txt'))) {
             if ((Test-Path $stale) -and ($stale -ne $keyFile)) {
                 Remove-Item $stale -Force -ErrorAction SilentlyContinue
                 Write-Log "Removed old key copy at $stale"
             }
         }
 
-        # --- Escrow to the Google Sheet -------------------------------------
-        $serial = 'unknown'
-        try {
-            $serial = "$((Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber)".Trim()
-        } catch { }
-
-        $escrowed = Send-BitLockerKeyToSheet -Computer $env:COMPUTERNAME -Serial $serial -RecoveryKey $rp.RecoveryPassword -KeyId "$($rp.KeyProtectorId)"
-
-        if ($escrowed) {
-            $actions += 'key escrowed to Google Sheet'
-            # Safely stored, so the key itself stays out of Atera's run history.
-            Write-Log "Recovery key for $env:COMPUTERNAME (serial $serial) is in the Google Sheet. Key ID: $($rp.KeyProtectorId)"
-        }
-        else {
-            # Nowhere else to put it - print it so it is not lost, and say so.
-            Write-Log 'Sheet escrow unavailable - printing the key to this output instead.' 'WARN'
-            Write-Log "BITLOCKER RECOVERY KEY ($env:COMPUTERNAME / $serial): $($rp.RecoveryPassword)"
-        }
 
         # Old script's insecure drop on the root of C:.
         if (Test-Path 'C:\BitLocker_RecoveryKey.txt') {
