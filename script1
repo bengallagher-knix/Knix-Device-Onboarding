@@ -125,7 +125,15 @@ param(
 
     # Konica Minolta universal driver pack (~174 MB zip). Only downloaded when
     # the driver is missing. Printer names and IPs live with the Printers step.
-    [string]$PrinterDriverUrl = 'https://public.integration.yamayuri.kiku8101.com/publicdownload/download?fileId=052EC7D2-4F05-46EA-A0CE-FB3E7B843C39',
+    #
+    # Sources are tried in order. Konica's portal link is unreliable for
+    # unattended downloads, so put your own copy FIRST - e.g. upload the zip as
+    # a GitHub release asset next to the Splashtop installer - and leave the
+    # Konica link as the fallback.
+    [string[]]$PrinterDriverUrl = @(
+        # 'https://github.com/bengallagher-knix/<repo>/releases/download/<tag>/KMCSeries_Drivers.zip',
+        'https://cscsupportftp.mykonicaminolta.com/DownloadFile/Download.ashx?fileversionid=44307&productid=2175'
+    ),
 
     [string]$ServiceDeskUrl = 'https://knixwear.atlassian.net/servicedesk/customer/portals',
 
@@ -1331,15 +1339,44 @@ function Invoke-MsiInstall {
     $msiArgs = @('/i', "`"$MsiPath`"") + $Properties + @('/qn','/norestart','/L*v', "`"$msiLog`"")
     $code    = Invoke-Native -FilePath 'msiexec.exe' -Arguments $msiArgs -TimeoutSec $TimeoutSec -Label $Label
 
+    # Kept so callers can put the real code in the step summary.
+    $Script:LastMsiExitCode = $code
+
     switch ($code) {
         0     { Write-Log "$Label installed." 'SUCCESS'; return $true }
         1641  { Write-Log "$Label installed; reboot initiated by installer." 'WARN'; $Script:RebootNeeded = $true; return $true }
         3010  { Write-Log "$Label installed; reboot required." 'WARN'; $Script:RebootNeeded = $true; return $true }
-        1618  { Write-Log "$Label failed: another Windows Installer session is busy (1618)." 'ERROR'; return $false }
-        1603  { Write-Log "$Label failed: MSI fatal error 1603. See $msiLog" 'ERROR'; return $false }
-        -1    { Write-Log "$Label timed out and was killed." 'ERROR'; return $false }
-        default { Write-Log "$Label failed with exit code $code. See $msiLog" 'ERROR'; return $false }
+        1618  { Write-Log "$Label failed: another Windows Installer session is busy (1618)." 'ERROR' }
+        1603  { Write-Log "$Label failed: MSI fatal error 1603." 'ERROR' }
+        1638  { Write-Log "$Label failed: another version of this product is already installed (1638)." 'ERROR' }
+        -1    { Write-Log "$Label timed out and was killed." 'ERROR' }
+        default { Write-Log "$Label failed with exit code $code." 'ERROR' }
     }
+
+    Write-MsiLogErrors -MsiLog $msiLog
+    return $false
+}
+
+<#
+    Pulls the lines that actually explain an MSI failure out of its verbose log,
+    so the reason is in Onboarding.log instead of buried in a 5 MB file.
+#>
+function Write-MsiLogErrors {
+    param([string]$MsiLog)
+
+    if (-not (Test-Path $MsiLog)) { return }
+    Write-Log "Key lines from $MsiLog :" 'WARN'
+    try {
+        $hits = Select-String -Path $MsiLog -Pattern 'Product: .* -- ', 'Error \d{4}\.', 'returned actual error code', 'Return value 3' -ErrorAction Stop |
+                Select-Object -First 8
+        foreach ($h in $hits) {
+            $line = $h.Line.Trim()
+            if ($line.Length -gt 300) { $line = $line.Substring(0, 300) + '...' }
+            Write-Log "  $line" 'WARN'
+        }
+        if (-not $hits) { Write-Log '  (no recognisable error lines - open the log itself)' 'WARN' }
+    }
+    catch { Write-Log "  Could not read the MSI log: $($_.Exception.Message)" 'WARN' }
 }
 
 <#
@@ -1463,6 +1500,36 @@ function Test-SplashtopInstalled {
     this walks the whole Splashtop key tree for any value whose DATA is the
     deployment code, then falls back to scanning the config files.
 #>
+<#
+    Writes everything under the Splashtop key to the log, so a failed
+    enrolment check can be diagnosed from the log alone - it shows where (and
+    whether) this Streamer build keeps its deployment code. Values whose names
+    suggest a secret are redacted and binary data is summarised by length.
+#>
+function Write-SplashtopDiagnostics {
+    Write-Log '--- Splashtop registry dump (to diagnose enrolment) ---' 'WARN'
+    foreach ($p in $Script:SplashtopRegPaths) {
+        if (-not (Test-Path $p)) { continue }
+        $keys = @(Get-Item -Path $p -ErrorAction SilentlyContinue) + @(Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue)
+        foreach ($k in $keys) {
+            if (-not $k) { continue }
+            try { $names = $k.GetValueNames() } catch { continue }
+            foreach ($n in $names) {
+                $v = $null
+                try { $v = $k.GetValue($n) } catch { }
+                if ($n -match '(?i)pass|pwd|secret|token|hash|privatekey') { $shown = '[redacted]' }
+                elseif ($v -is [byte[]]) { $shown = "[binary, $($v.Length) bytes]" }
+                else {
+                    $shown = "$v"
+                    if ($shown.Length -gt 80) { $shown = $shown.Substring(0, 80) + '...' }
+                }
+                Write-Log "  $($k.Name) | $n = $shown"
+            }
+        }
+    }
+    Write-Log '--- end of Splashtop registry dump ---' 'WARN'
+}
+
 function Test-SplashtopDeployCode {
     param([Parameter(Mandatory)][string]$Code)
 
@@ -1479,7 +1546,10 @@ function Test-SplashtopDeployCode {
             try { $names = $k.GetValueNames() } catch { continue }
             foreach ($valueName in $names) {
                 try { $data = "$($k.GetValue($valueName))" } catch { continue }
-                if ($data -eq $Code) {
+                # Substring, not equality - some builds store the code with
+                # extra text around it. A third-party script reads a value
+                # called DCode; this finds it under any name.
+                if ($data.IndexOf($Code, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     Write-Log "Deployment code found in registry: $($k.Name) -> $valueName" 'SUCCESS'
                     return $true
                 }
@@ -1957,72 +2027,76 @@ Invoke-Step -Name 'Splashtop' -Body {
         return @{ Status = 'FAILED'; Detail = 'Installer signature not valid - refused to run' }
     }
 
-    # Splashtop Easy Deployment syntax. dcode= is what stops the Streamer from
-    # prompting for the deployment code after install.
+    # Splashtop Easy Deployment syntax. dcode= tells the Streamer which team to
+    # join; without it the Streamer prompts for a code after install.
     #
-    # The installer routinely does NOT exit - it starts the Streamer and stays
-    # resident - so waiting on the process is how this used to hang for the
-    # full timeout. Success is polled for instead: the moment the Streamer is
-    # detected on disk, the install is done and we stop waiting.
+    # Two traps this block avoids:
+    #
+    #  * prevercheck makes the installer SKIP itself when the same version is
+    #    already installed. Harmless on a fresh install, but on a repair -
+    #    Streamer present, code missing - it turns the whole run into a no-op.
+    #    So it is only used when the Streamer is not installed yet.
+    #
+    #  * The installer often stays resident after finishing, so success is
+    #    polled for rather than waited on. What is polled for is the DEPLOYMENT
+    #    CODE appearing - not merely the Streamer being on disk. An earlier
+    #    version polled for "installed", which on a repair is true within five
+    #    seconds, so the installer was killed ~50s in, before it had written
+    #    the code. That is why enrolment kept coming back False.
     #
     # NOTE: no uninstall first. Re-running over an existing install applies the
-    # new deployment configuration and keeps the machine reachable throughout.
-    $argSets = @(
-        @('prevercheck','/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"),
-        @('/s','/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"),
-        @('/s','/i', 'confirm_d=0,hidewindow=1'),   # deploy package: code is embedded
-        @('/s')
-    )
+    # deployment configuration and keeps the machine reachable throughout.
+    $codeArgs = "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"
 
-    $installOk = $false
-    $attempt = 0
+    $argSets = @()
+    if (-not $isInstalled) { $argSets += ,@('prevercheck', '/s', '/i', $codeArgs) }
+    $argSets += ,@('/s', '/i', $codeArgs)
+    $argSets += ,@('/s', '/i', 'confirm_d=0,hidewindow=1')   # deploy package: code is embedded
+
+    $enrolled = $false
+    $attempt  = 0
 
     foreach ($set in $argSets) {
 
         $attempt++
 
-        $result = Invoke-NativeUntil -FilePath $exe -Arguments $set -Label "splashtop-$attempt" -TimeoutSec 420 -PollSeconds 5 -GraceSeconds 45 -SuccessTest { Test-SplashtopInstalled }
+        $result = Invoke-NativeUntil -FilePath $exe -Arguments $set -Label "splashtop-$attempt" -TimeoutSec 300 -PollSeconds 5 -GraceSeconds 20 -SuccessTest { Test-SplashtopDeployCode -Code $SplashtopDeployCode }
+
+        if ($result.ExitCode -in @(1641, 3010)) { $Script:RebootNeeded = $true }
 
         if ($result.Success) {
-            Write-Log "Splashtop installed on attempt $attempt in $($result.Seconds)s (exit $($result.ExitCode), killed=$($result.Killed))." 'SUCCESS'
-            if ($result.ExitCode -in @(1641, 3010)) { $Script:RebootNeeded = $true }
-            $installOk = $true
+            Write-Log "Deployment code applied on attempt $attempt after $($result.Seconds)s." 'SUCCESS'
+            $enrolled = $true
             break
         }
 
-        Write-Log "Splashtop attempt $attempt did not install (exit $($result.ExitCode)) - trying the next argument set." 'WARN'
+        Write-Log "Attempt $attempt ended without the deployment code appearing (exit $($result.ExitCode), killed=$($result.Killed))." 'WARN'
         Start-Sleep -Seconds 5
     }
 
     Remove-Item $exe -Force -ErrorAction SilentlyContinue
 
-    if (-not $installOk) {
-        return @{ Status = 'FAILED'; Detail = 'Installer did not return a success code' }
+    if (-not (Test-SplashtopInstalled)) {
+        return @{ Status = 'FAILED'; Detail = 'Streamer is not installed after every attempt' }
     }
 
-    $verified = $false
-    for ($i = 1; $i -le 10; $i++) {
-        Start-Sleep -Seconds 5
-        if (Test-SplashtopInstalled) { $verified = $true; break }
-        Write-Log "Splashtop verification attempt $i of 10..."
+    $svcFound = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Splashtop*' })
+    foreach ($s in $svcFound) {
+        Write-Log "Splashtop service: $($s.DisplayName) [$($s.Status)]"
+        if ($s.Status -ne 'Running' -and $s.StartType -ne 'Disabled') {
+            try { Start-Service -Name $s.Name -ErrorAction Stop; Write-Log "Started $($s.Name)." }
+            catch { Write-Log "Could not start $($s.Name): $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    if ($svcFound.Count -eq 0) { Write-Log 'No Splashtop service found after install.' 'WARN' }
+
+    if (-not $enrolled) {
+        # Honest failure, plus everything needed to see why.
+        Write-SplashtopDiagnostics
+        return @{ Status = 'FAILED'; Detail = "Streamer installed but deployment code $SplashtopDeployCode was not applied - registry dump is in the log" }
     }
 
-    if (-not $verified) {
-        return @{ Status = 'FAILED'; Detail = 'Installer succeeded but Streamer not detected' }
-    }
-
-
-    $enrolled = Test-SplashtopDeployCode -Code $SplashtopDeployCode
-    $svcFound = Get-Service -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -like '*Splashtop*' }
-    foreach ($s in $svcFound) { Write-Log "Splashtop service: $($s.DisplayName) [$($s.Status)]" }
-
-    if (-not $svcFound) { Write-Log 'No Splashtop service found after install.' 'WARN' }
-
-    return @{
-        Status = 'INSTALLED'
-        Detail = "Streamer installed with dcode=$SplashtopDeployCode (enrolment confirmed: $enrolled)"
-    }
+    return @{ Status = 'INSTALLED'; Detail = "Streamer enrolled with deployment code $SplashtopDeployCode" }
 }
 
 # ============================================================================
@@ -2142,7 +2216,8 @@ Invoke-Step -Name 'CoreApps' -Body {
         Remove-Item $path -Force -ErrorAction SilentlyContinue
 
         if (-not $ok) {
-            $failed += "$($app.Name) (installer)"
+            if ($app.Kind -eq 'msi') { $failed += "$($app.Name) (installer exit $Script:LastMsiExitCode)" }
+            else { $failed += "$($app.Name) (installer)" }
             continue
         }
 
