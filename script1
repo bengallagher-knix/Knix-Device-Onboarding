@@ -19,10 +19,11 @@
       1. Malwarebytes / ThreatDown Endpoint Agent
       2. Splashtop Streamer (with deployment code applied)
       3. Core apps: Google Chrome, Slack, Google Drive for Desktop
-      4. Purge Lenovo AI (AI Now / Qira)
-      5. Knix Service Desk desktop shortcut
-      6. Corporate wallpaper
-      7. BitLocker (never reboots unless -AllowReboot is passed)
+      4. Konica Minolta driver + Fifth, Sixth and Seventh Floor printers
+      5. Purge Lenovo AI (AI Now / Qira)
+      6. Knix Service Desk desktop shortcut
+      7. Corporate wallpaper
+      8. BitLocker (never reboots unless -AllowReboot is passed)
 
 .NOTES
     Run as SYSTEM / Administrator. PowerShell 5.1.
@@ -122,6 +123,10 @@ param(
 
     [string]$WallpaperUrl = 'https://raw.githubusercontent.com/bengallagher-knix/knix-pride-wallpaper/main/knixwallpaper.jpg',
 
+    # Konica Minolta universal driver pack (~174 MB zip). Only downloaded when
+    # the driver is missing. Printer names and IPs live with the Printers step.
+    [string]$PrinterDriverUrl = 'https://public.integration.yamayuri.kiku8101.com/publicdownload/download?fileId=052EC7D2-4F05-46EA-A0CE-FB3E7B843C39',
+
     [string]$ServiceDeskUrl = 'https://knixwear.atlassian.net/servicedesk/customer/portals',
 
     # ------------------------------------------------------------------------
@@ -143,7 +148,7 @@ param(
     [switch]$RemovalDryRun,
 
     # Step names to skip, e.g. -Skip BitLocker,Wallpaper
-    [ValidateSet('Malwarebytes','Splashtop','CoreApps','RemoveLenovoAI','ServiceDesk','Wallpaper','BitLocker')]
+    [ValidateSet('Malwarebytes','Splashtop','CoreApps','Printers','RemoveLenovoAI','ServiceDesk','Wallpaper','BitLocker')]
     [string[]]$Skip = @(),
 
     # BitLocker needs a reboot to finish. OFF by default so the script never
@@ -660,8 +665,29 @@ function Invoke-Download {
         [Parameter(Mandatory)][string]$Destination,
         [int]$MinBytes = 100KB,
         [int]$TimeoutSec = 300,
-        [int]$Retries = 2
+        [int]$Retries = 2,
+        # Extra request headers. Some vendor portals (Konica Minolta) refuse
+        # downloads without a browser User-Agent and a Referer.
+        [hashtable]$Headers = @{}
     )
+
+    # Windows PowerShell 5.1 will not take User-Agent through -Headers, so it
+    # is split out onto -UserAgent and everything else goes through -Headers.
+    $iwrExtra = @{}
+    $iwrHeaders = @{}
+    foreach ($k in $Headers.Keys) {
+        if ($k -eq 'User-Agent') { $iwrExtra['UserAgent'] = $Headers[$k] }
+        else { $iwrHeaders[$k] = $Headers[$k] }
+    }
+    if ($iwrHeaders.Count -gt 0) { $iwrExtra['Headers'] = $iwrHeaders }
+
+    # curl takes every header the same way. Start-Process passes arguments
+    # through verbatim, so values containing spaces must carry their own quotes.
+    $curlHeaderArgs = @()
+    foreach ($k in $Headers.Keys) {
+        $curlHeaderArgs += '-H'
+        $curlHeaderArgs += "`"$($k): $($Headers[$k])`""
+    }
 
     $sourceNumber = 0
 
@@ -676,7 +702,7 @@ function Invoke-Download {
 
             try {
                 Write-Log "  Invoke-WebRequest attempt $attempt of $Retries..."
-                Invoke-WebRequest -Uri $candidate -OutFile $Destination -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+                Invoke-WebRequest -Uri $candidate -OutFile $Destination -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop @iwrExtra
             }
             catch {
                 Write-Log "  Invoke-WebRequest failed: $($_.Exception.Message)" 'WARN'
@@ -698,12 +724,13 @@ function Invoke-Download {
             $curl = Join-Path $env:WINDIR 'System32\curl.exe'
             if (Test-Path $curl) {
                 Remove-Item $Destination -Force -ErrorAction SilentlyContinue
-                $rc = Invoke-Native -FilePath $curl -Label 'curl' -TimeoutSec ($TimeoutSec + 30) -Arguments @(
+                $rc = Invoke-Native -FilePath $curl -Label 'curl' -TimeoutSec ($TimeoutSec + 30) -Arguments (@(
                     '-L','--fail','--silent','--show-error',
-                    '--max-time', "$TimeoutSec",
+                    '--max-time', "$TimeoutSec"
+                ) + $curlHeaderArgs + @(
                     '-o', $Destination,
                     $candidate
-                )
+                ))
                 if ($rc -eq 0 -and (Test-Path $Destination) -and ((Get-Item $Destination).Length -ge $MinBytes)) {
                     $mb = [math]::Round((Get-Item $Destination).Length / 1MB, 2)
                     Write-Log "Downloaded $mb MB via curl to $Destination" 'SUCCESS'
@@ -1570,6 +1597,25 @@ function Get-DeviceHealth {
         }
     } catch { Add-HealthCheck 'Lenovo AI purged' $false "check error: $($_.Exception.Message)" }
 
+    # --- Printers -----------------------------------------------------------
+    try {
+        if ($Skip -contains 'Printers') {
+            Add-HealthCheck 'Printers' 'SKIPPED' 'skipped by parameter'
+        }
+        else {
+            $missing = @()
+            if (-not (Get-PrinterDriver -Name $Script:KnixPrinterDriver -ErrorAction SilentlyContinue)) { $missing += 'driver' }
+            foreach ($kp in $Script:KnixPrinters) {
+                $obj = Get-Printer -Name $kp.Name -ErrorAction SilentlyContinue
+                if (-not $obj) { $missing += $kp.Name; continue }
+                $portIp = (Get-PrinterPort -Name $obj.PortName -ErrorAction SilentlyContinue).PrinterHostAddress
+                if ($portIp -ne $kp.Ip) { $missing += "$($kp.Name) (wrong IP: $portIp)" }
+            }
+            if ($missing.Count -gt 0) { Add-HealthCheck 'Printers' $false "missing or wrong: $($missing -join ', ')" }
+            else { Add-HealthCheck 'Printers' $true "driver + $(($Script:KnixPrinters | ForEach-Object { $_.Name }) -join ', ')" }
+        }
+    } catch { Add-HealthCheck 'Printers' $false "check error: $($_.Exception.Message)" }
+
     # --- Service desk shortcut ---------------------------------------------
     try {
         if ($Skip -contains 'ServiceDesk') {
@@ -2130,7 +2176,222 @@ Invoke-Step -Name 'CoreApps' -Body {
 }
 
 # ============================================================================
-# STEP 4 - PURGE LENOVO AI (AI Now / Qira)
+# STEP 4 - KONICA MINOLTA PRINTERS
+#
+# All three models use the one KONICA MINOLTA Universal PS driver, so the
+# ~174 MB driver pack is only downloaded when that driver is missing. Each
+# printer is then checked against its expected driver and port and corrected
+# if it has drifted.
+#
+# A Standard TCP/IP port does not need the printer to be reachable when it is
+# created, so this works off-site too - the printers come online the first
+# time the laptop is on the office network.
+#
+# EDIT THIS LIST to add, move or re-address a printer. The health check reads
+# the same list, so nothing else needs changing.
+# ============================================================================
+
+$Script:KnixPrinterDriver = 'KONICA MINOLTA Universal PS'
+
+$Script:KnixPrinters = @(
+    [pscustomobject]@{ Name = 'Fifth Floor';   Model = '550i'; Ip = '192.168.70.18'; Location = '5th Floor' },
+    [pscustomobject]@{ Name = 'Sixth Floor';   Model = '360i'; Ip = '192.168.70.17'; Location = '6th Floor' },
+    [pscustomobject]@{ Name = 'Seventh Floor'; Model = '250i'; Ip = '192.168.70.19'; Location = '7th Floor' }
+)
+
+Invoke-Step -Name 'Printers' -Body {
+
+    $driverName = $Script:KnixPrinterDriver
+    $changes = @()
+    $failed  = @()
+
+    # --- 0. Print Spooler ----------------------------------------------------
+    # Nothing below works without it, and some hardening baselines disable it.
+    $spooler = Get-Service -Name 'Spooler' -ErrorAction SilentlyContinue
+    if (-not $spooler) {
+        return @{ Status = 'FAILED'; Detail = 'Print Spooler service is not present on this device' }
+    }
+    if ($spooler.StartType -eq 'Disabled') {
+        Set-Service -Name 'Spooler' -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Log 'Print Spooler was disabled - set to Automatic.' 'WARN'
+        $changes += 'spooler re-enabled'
+    }
+    if ((Get-Service -Name 'Spooler').Status -ne 'Running') {
+        try {
+            Start-Service -Name 'Spooler' -ErrorAction Stop
+            Write-Log 'Print Spooler started.'
+            $changes += 'spooler started'
+        }
+        catch {
+            return @{ Status = 'FAILED'; Detail = "Print Spooler will not start: $($_.Exception.Message)" }
+        }
+    }
+
+    # --- 1. Driver -----------------------------------------------------------
+    if (Get-PrinterDriver -Name $driverName -ErrorAction SilentlyContinue) {
+        Write-Log "$driverName is already installed - skipping the driver download."
+    }
+    else {
+        Write-Log "$driverName is missing - fetching the driver pack."
+
+        $zip     = Join-Path $Script:TempDir 'KM_Drivers.zip'
+        $extract = Join-Path $Script:TempDir 'KM_Drivers'
+
+        try {
+            # The Konica portal refuses requests that do not look like a browser.
+            $headers = @{
+                'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                'Referer'    = 'https://onyxweb.mykonicaminolta.com/'
+            }
+
+            if (-not (Invoke-Download -Url $PrinterDriverUrl -Destination $zip -MinBytes 100MB -TimeoutSec 900 -Headers $headers)) {
+                return @{ Status = 'FAILED'; Detail = 'Konica Minolta driver pack download failed' }
+            }
+
+            if (Test-Path $extract) { Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue }
+
+            # ZipFile is many times faster than Expand-Archive on Windows
+            # PowerShell 5.1, which matters on a 174 MB pack.
+            Write-Log 'Extracting driver pack...'
+            try {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $extract)
+            }
+            catch {
+                Write-Log "Fast extract failed ($($_.Exception.Message)) - falling back to Expand-Archive." 'WARN'
+                if (Test-Path $extract) { Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue }
+                Expand-Archive -Path $zip -DestinationPath $extract -Force -ErrorAction Stop
+            }
+
+            # Find the INF rather than trusting a fixed path - Konica has moved
+            # the folder layout between pack releases. Prefer the x64 PS build.
+            $inf = Get-ChildItem -Path $extract -Recurse -Filter 'KOAWOA__.inf' -ErrorAction SilentlyContinue |
+                   Sort-Object { if ($_.FullName -match '\\PS\\.*Win_x64\\') { 0 } else { 1 } } |
+                   Select-Object -First 1
+
+            if (-not $inf) {
+                return @{ Status = 'FAILED'; Detail = 'KOAWOA__.inf not found in the driver pack - its layout may have changed' }
+            }
+            Write-Log "Driver INF: $($inf.FullName)"
+
+            # Stage the driver into the Windows driver store.
+            #   0    = added
+            #   259  = added, but no matching device present to install it on.
+            #          Normal for network printers - the printer object comes later.
+            #   3010 = added, reboot required
+            $rc = Invoke-Native -FilePath "$env:WINDIR\System32\pnputil.exe" -Arguments @('/add-driver', "`"$($inf.FullName)`"", '/install') -TimeoutSec 600 -Label 'pnputil'
+            if ($rc -eq 3010) { $Script:RebootNeeded = $true }
+            if ($rc -notin @(0, 259, 3010)) {
+                Write-Log "pnputil returned $rc - attempting to register the driver regardless." 'WARN'
+            }
+
+            # Register it with the spooler. If the name lookup fails, point it
+            # straight at the INF as a second route.
+            try {
+                Add-PrinterDriver -Name $driverName -ErrorAction Stop
+            }
+            catch {
+                Write-Log "Add-PrinterDriver by name failed ($($_.Exception.Message)) - retrying from the INF." 'WARN'
+                Add-PrinterDriver -Name $driverName -InfPath $inf.FullName -ErrorAction Stop
+            }
+
+            if (-not (Get-PrinterDriver -Name $driverName -ErrorAction SilentlyContinue)) {
+                return @{ Status = 'FAILED'; Detail = "$driverName did not register with the spooler" }
+            }
+
+            Write-Log "$driverName installed." 'SUCCESS'
+            $changes += 'driver installed'
+        }
+        catch {
+            return @{ Status = 'FAILED'; Detail = "Driver install failed: $($_.Exception.Message)" }
+        }
+        finally {
+            # 174 MB zip plus the extracted tree - never leave these behind.
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 2. Ports and printers -----------------------------------------------
+    foreach ($p in $Script:KnixPrinters) {
+
+        try {
+            # Reuse ANY existing port that already points at this IP, whatever
+            # it is called - a printer added by hand earlier (e.g. a port named
+            # Port_192.168.70.18) must not get a duplicate.
+            $port = Get-PrinterPort -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PrinterHostAddress -eq $p.Ip } |
+                    Select-Object -First 1
+
+            if (-not $port) {
+                $portName = "IP_$($p.Ip)"
+                Add-PrinterPort -Name $portName -PrinterHostAddress $p.Ip -ErrorAction Stop
+                Write-Log "Created port $portName -> $($p.Ip)" 'SUCCESS'
+                $changes += "port $($p.Ip)"
+            }
+            else {
+                $portName = $port.Name
+            }
+
+            $existing = Get-Printer -Name $p.Name -ErrorAction SilentlyContinue
+
+            if (-not $existing) {
+                Add-Printer -Name $p.Name -DriverName $driverName -PortName $portName -Location $p.Location -Comment "Konica Minolta $($p.Model)" -ErrorAction Stop
+                Write-Log "Added printer '$($p.Name)' ($($p.Model), $($p.Ip))" 'SUCCESS'
+                $changes += "added $($p.Name)"
+            }
+            else {
+                # Present - make sure it still has the right driver and port.
+                $fix = @{}
+                if ($existing.DriverName -ne $driverName) { $fix['DriverName'] = $driverName }
+                if ($existing.PortName   -ne $portName)   { $fix['PortName']   = $portName }
+
+                if ($fix.Count -gt 0) {
+                    Set-Printer -Name $p.Name @fix -ErrorAction Stop
+                    Write-Log "Corrected '$($p.Name)': $(($fix.Keys | Sort-Object) -join ', ')" 'SUCCESS'
+                    $changes += "fixed $($p.Name)"
+                }
+                else {
+                    Write-Log "'$($p.Name)' already correct."
+                }
+            }
+
+            # Other printer objects pointed at the same IP under a different
+            # name are left alone, but flagged - users would see duplicates.
+            $dupes = @(Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $portName -and $_.Name -ne $p.Name })
+            foreach ($d in $dupes) {
+                Write-Log "Note: '$($d.Name)' also prints to $($p.Ip). Left in place - remove it by hand if it is a duplicate." 'WARN'
+            }
+
+            # Reachability is informational only: off-site is expected.
+            $reachable = $false
+            try {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $ar = $tcp.BeginConnect($p.Ip, 9100, $null, $null)
+                $reachable = $ar.AsyncWaitHandle.WaitOne(1500, $false) -and $tcp.Connected
+                $tcp.Close()
+            } catch { }
+
+            if ($reachable) { Write-Log "'$($p.Name)' is reachable at $($p.Ip):9100." }
+            else { Write-Log "'$($p.Name)' not reachable from here - normal when off the office network." }
+        }
+        catch {
+            Write-Log "Printer '$($p.Name)' failed: $($_.Exception.Message)" 'ERROR'
+            $failed += $p.Name
+        }
+    }
+
+    $detailParts = @()
+    if ($changes.Count -gt 0) { $detailParts += ($changes -join ', ') }
+    if ($failed.Count -gt 0)  { $detailParts += "FAILED: $($failed -join ', ')" }
+
+    if ($failed.Count -gt 0)  { return @{ Status = 'FAILED';     Detail = ($detailParts -join ' | ') } }
+    if ($changes.Count -eq 0) { return @{ Status = 'ALREADY OK'; Detail = 'Driver and all three printers already correct' } }
+    return @{ Status = 'CHANGED'; Detail = ($detailParts -join ' | ') }
+}
+
+# ============================================================================
+# STEP 5 - PURGE LENOVO AI (AI Now / Qira)
 #
 # Removes every trace: Appx packages for all users, the provisioned copy on the
 # image (so new profiles do not get it back), Win32 uninstall entries, services,
@@ -2256,7 +2517,7 @@ Invoke-Step -Name 'RemoveLenovoAI' -Body {
 }
 
 # ============================================================================
-# STEP 5 - KNIX SERVICE DESK SHORTCUT
+# STEP 6 - KNIX SERVICE DESK SHORTCUT
 # Get-LocalUser is gone - it needs the LocalAccounts module and throws on some
 # builds. Profile folders are enumerated directly instead.
 # ============================================================================
@@ -2338,7 +2599,7 @@ IconIndex=160
 }
 
 # ============================================================================
-# STEP 6 - CORPORATE WALLPAPER
+# STEP 7 - CORPORATE WALLPAPER
 # ============================================================================
 
 Invoke-Step -Name 'Wallpaper' -Body {
@@ -2477,7 +2738,7 @@ public class KnixWallpaper {
 }
 
 # ============================================================================
-# STEP 7 - BITLOCKER
+# STEP 8 - BITLOCKER
 # Last on purpose, and it NEVER reboots unless -AllowReboot is passed. The old
 # script's "shutdown /r /t 60" is what killed the rest of the Atera chain.
 # ============================================================================
