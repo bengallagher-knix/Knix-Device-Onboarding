@@ -117,7 +117,19 @@ param(
 
     [string]$SplashtopInstallerUrl = 'https://github.com/bengallagher-knix/splashtopdeployment/releases/download/splashtop-v1/Splashtop_Streamer_Windows_DEPLOY_INSTALLER_v3.8.6.0_TKXZT7R7SSSP.exe',
 
-    [string]$MalwarebytesToken = 'ed558c71-63f0-40c2-80c0-ee5ca74ec18e',
+    # Splashtop cannot put a deployment code onto an existing install - its own
+    # docs say "Upgrade is not supported using Easy Deployment". So a Streamer
+    # found WITHOUT the code is uninstalled and reinstalled with it. Set to
+    # $false to report the problem instead of fixing it.
+    [bool]$SplashtopReinstallIfNotEnrolled = $true,
+
+    # Malwarebytes / ThreatDown Nebula account token.
+    #
+    # LEAVE THIS BLANK IN GIT. This script is published to a public GitHub
+    # repo, and anyone holding the token can enrol machines into the Knix
+    # Malwarebytes account. It comes from the KNIX_MB_TOKEN environment
+    # variable, which the bootstrap (in Atera) sets.
+    [string]$MalwarebytesToken = '',
 
     [string]$MalwarebytesGroupId = '43ebd935-dc34-4472-b192-7e0827985b61',
 
@@ -126,12 +138,15 @@ param(
     # Konica Minolta universal driver pack (~174 MB zip). Only downloaded when
     # the driver is missing. Printer names and IPs live with the Printers step.
     #
-    # Sources are tried in order. Konica's portal link is unreliable for
-    # unattended downloads, so put your own copy FIRST - e.g. upload the zip as
-    # a GitHub release asset next to the Splashtop installer - and leave the
-    # Konica link as the fallback.
+    # Sources are tried in order. Konica's portal links proved unreliable for
+    # unattended downloads, so Knix's own copy on Google Drive comes first and
+    # the Konica link is the fallback.
+    #
+    # A Google Drive share link can be pasted in exactly as Drive gives it -
+    # the script converts it to a direct download. The file must be shared as
+    # "Anyone with the link"; a laptop running as SYSTEM has no Google login.
     [string[]]$PrinterDriverUrl = @(
-        # 'https://github.com/bengallagher-knix/<repo>/releases/download/<tag>/KMCSeries_Drivers.zip',
+        'https://drive.google.com/file/d/1oPGwh5C4yCwOLpoTSu0nbHGt9ZolX6D1/view?usp=drive_link',
         'https://cscsupportftp.mykonicaminolta.com/DownloadFile/Download.ashx?fileversionid=44307&productid=2175'
     ),
 
@@ -172,6 +187,9 @@ Write-Host "=== KNIX ONBOARDING STARTING $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss
 # command line.
 if ([string]::IsNullOrWhiteSpace($SlackBotToken) -and $env:KNIX_SLACK_TOKEN) {
     $SlackBotToken = $env:KNIX_SLACK_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($MalwarebytesToken) -and $env:KNIX_MB_TOKEN) {
+    $MalwarebytesToken = $env:KNIX_MB_TOKEN
 }
 if ([string]::IsNullOrWhiteSpace($SlackChannel) -and $env:KNIX_SLACK_CHANNEL) {
     $SlackChannel = $env:KNIX_SLACK_CHANNEL
@@ -214,6 +232,10 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
             # in the process list. Hand it over through the inherited environment.
             if ($kvp.Key -eq 'SlackBotToken') {
                 $env:KNIX_SLACK_TOKEN = $kvp.Value
+                continue
+            }
+            if ($kvp.Key -eq 'MalwarebytesToken') {
+                $env:KNIX_MB_TOKEN = $kvp.Value
                 continue
             }
 
@@ -481,6 +503,20 @@ function Send-SlackSummary {
 }
 
 <#
+    Masks secrets in a command line before it is logged. The Malwarebytes
+    install passes NEBULA_ACCOUNTTOKEN on the msiexec command line, and every
+    command line is logged - which used to put the token in Atera's output.
+#>
+function Protect-CommandLine {
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $Text = $Text -replace '(?i)(NEBULA_ACCOUNTTOKEN=)[^\s"]+', '$1[REDACTED]'
+    $Text = $Text -replace '(?i)\b((?:token|secret|password|pwd)=)[^\s",]+', '$1[REDACTED]'
+    $Text = $Text -replace 'xox[baprs]-[A-Za-z0-9-]+', '[REDACTED-TOKEN]'
+    return $Text
+}
+
+<#
     Runs a native process with a HARD timeout. On timeout the whole process tree
     is killed. This is the main defence against a hung installer taking the
     onboarding down with it. Returns the exit code, or -1 if it had to be killed.
@@ -498,7 +534,7 @@ function Invoke-Native {
     $outFile = Join-Path $Script:LogDir ("proc_{0}_{1}.out.log" -f ($Label -replace '[^A-Za-z0-9_-]','_'), (Get-Date -Format 'HHmmss'))
     $errFile = [IO.Path]::ChangeExtension($outFile, 'err.log')
 
-    Write-Log "Running: $FilePath $($Arguments -join ' ')  (timeout ${TimeoutSec}s)"
+    Write-Log "Running: $FilePath $(Protect-CommandLine ($Arguments -join ' '))  (timeout ${TimeoutSec}s)"
 
     try {
         $spArgs = @{
@@ -573,7 +609,7 @@ function Invoke-NativeUntil {
     $outFile = Join-Path $Script:LogDir ("proc_{0}_{1}.out.log" -f ($Label -replace '[^A-Za-z0-9_-]','_'), (Get-Date -Format 'HHmmss'))
     $errFile = [IO.Path]::ChangeExtension($outFile, 'err.log')
 
-    Write-Log "Running (polled): $FilePath $($Arguments -join ' ')  (max ${TimeoutSec}s)"
+    Write-Log "Running (polled): $FilePath $(Protect-CommandLine ($Arguments -join ' '))  (max ${TimeoutSec}s)"
 
     try {
         $spArgs = @{
@@ -662,6 +698,28 @@ function Invoke-NativeUntil {
 }
 
 <#
+    Turns a Google Drive share link into a direct download link.
+
+    A share link (drive.google.com/file/d/<id>/view) opens a web page, not the
+    file. drive.usercontent.google.com/download serves the bytes, and
+    confirm=t skips the "Google Drive can't scan this file for viruses" page
+    that Drive puts in front of anything over ~100 MB. Any other URL is
+    returned unchanged, so any download source can be pasted in as-is.
+#>
+function ConvertTo-DirectDownloadUrl {
+    param([Parameter(Mandatory)][string]$Url)
+
+    if ($Url -notmatch '(?i)^https://(drive|docs)\.google\.com/') { return $Url }
+
+    $id = $null
+    if ($Url -match '/file/d/([A-Za-z0-9_-]+)') { $id = $Matches[1] }
+    elseif ($Url -match '[?&]id=([A-Za-z0-9_-]+)') { $id = $Matches[1] }
+
+    if (-not $id) { return $Url }
+    return "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t"
+}
+
+<#
     Download with retries, a timeout, a minimum-size sanity check (catches HTML
     error pages), and a curl.exe fallback.
 #>
@@ -699,10 +757,12 @@ function Invoke-Download {
 
     $sourceNumber = 0
 
-    foreach ($candidate in $Url) {
+    foreach ($original in $Url) {
 
         $sourceNumber++
+        $candidate = ConvertTo-DirectDownloadUrl -Url $original
         Write-Log "Source $sourceNumber of $($Url.Count): $candidate"
+        if ($candidate -ne $original) { Write-Log "  (converted from share link $original)" }
 
         for ($attempt = 1; $attempt -le $Retries; $attempt++) {
 
@@ -725,6 +785,22 @@ function Invoke-Download {
             if (Test-Path $Destination) {
                 $got = (Get-Item $Destination).Length
                 Write-Log "  Got $got bytes, need at least $MinBytes - treating as a bad response." 'WARN'
+
+                # A small download is usually a web page instead of the file.
+                # Say so, because the fix depends on what the page was.
+                try {
+                    $head = [IO.File]::ReadAllText($Destination)
+                    if ($head.Length -gt 2000) { $head = $head.Substring(0, 2000) }
+                    if ($head -match '(?i)<html|<!doctype') {
+                        Write-Log '  The server returned a WEB PAGE, not the file.' 'WARN'
+                        if ($head -match '(?i)accounts\.google\.com|ServiceLogin|Sign in') {
+                            Write-Log '  It is a Google sign-in page: set the Drive file to "Anyone with the link" (Share > General access).' 'WARN'
+                        }
+                        elseif ($head -match '(?i)virus') {
+                            Write-Log '  It is Google Drive''s virus-scan warning page for large files.' 'WARN'
+                        }
+                    }
+                } catch { }
             }
 
             # curl.exe ships in Windows 10 1803+ and copes with proxies,
@@ -1501,6 +1577,66 @@ function Test-SplashtopInstalled {
     deployment code, then falls back to scanning the config files.
 #>
 <#
+    Is the Streamer PROGRAM installed? Unlike Test-SplashtopInstalled this
+    ignores the settings key and install folder, which an uninstall can leave
+    behind.
+#>
+function Test-SplashtopProductInstalled {
+    if (@(Get-UninstallEntry -NameLike '*Splashtop Streamer*').Count -gt 0) { return $true }
+    $svc = Get-Service -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -like 'SplashtopRemoteService*' -or $_.DisplayName -like 'Splashtop*Remote*Service*' }
+    return [bool]$svc
+}
+
+<#
+    Uninstalls the Streamer with Splashtop's documented command:
+        MsiExec.exe /qn /X{B7C5EA94-B96A-41F5-BE95-25D78B486678}
+    The product code in the registry is tried first, in case a build uses a
+    different one. Leftover settings are then removed so the reinstall is a
+    genuine new install rather than picking up the old, code-less config.
+#>
+function Uninstall-SplashtopStreamer {
+
+    $codes = @()
+    foreach ($e in @(Get-UninstallEntry -NameLike '*Splashtop Streamer*')) {
+        $s = "$($e.UninstallString) $($e.QuietUninstallString)"
+        if ($s -match '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') { $codes += $Matches[0] }
+    }
+    $codes += '{B7C5EA94-B96A-41F5-BE95-25D78B486678}'
+    $codes = @($codes | Select-Object -Unique)
+
+    foreach ($code in $codes) {
+        Wait-ForMsiIdle -TimeoutSec 120 | Out-Null
+        $rc = Invoke-Native -FilePath 'msiexec.exe' -Arguments @('/X', $code, '/qn', '/norestart') -TimeoutSec 300 -Label 'splashtop-uninstall'
+        if ($rc -in @(1641, 3010)) { $Script:RebootNeeded = $true }
+
+        # 1605 means nothing is installed under this code - try the next one.
+        for ($i = 0; $i -lt 12; $i++) {
+            if (-not (Test-SplashtopProductInstalled)) { break }
+            Start-Sleep -Seconds 5
+        }
+        if (-not (Test-SplashtopProductInstalled)) { break }
+        Write-Log "Streamer still present after uninstall with $code (exit $rc)." 'WARN'
+    }
+
+    if (Test-SplashtopProductInstalled) {
+        Write-Log 'Splashtop Streamer could not be uninstalled.' 'ERROR'
+        return $false
+    }
+    Write-Log 'Existing Splashtop Streamer uninstalled.' 'SUCCESS'
+
+    foreach ($p in $Script:SplashtopRegPaths) {
+        if (-not (Test-Path $p)) { continue }
+        try {
+            Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+            Write-Log "Removed leftover Splashtop settings at $p"
+        }
+        catch { Write-Log "Could not remove leftover settings at $p : $($_.Exception.Message)" 'WARN' }
+    }
+    return $true
+}
+
+<#
     Writes everything under the Splashtop key to the log, so a failed
     enrolment check can be diagnosed from the log alone - it shows where (and
     whether) this Streamer build keeps its deployment code. Values whose names
@@ -1627,6 +1763,7 @@ function Get-DeviceHealth {
         @{ Name = 'Google Chrome'; Test = {
                (Test-Path 'C:\Program Files\Google\Chrome\Application\chrome.exe') -or
                (Test-Path 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') -or
+               (Test-PerUserPath -RelativePath 'AppData\Local\Google\Chrome\Application\chrome.exe') -or
                [bool](Get-InstalledApp -NameLike 'Google Chrome') } },
         @{ Name = 'Slack'; Test = {
                [bool](Get-InstalledApp -NameLike '*Slack*') -or
@@ -1949,6 +2086,12 @@ Invoke-Step -Name 'Malwarebytes' -Body {
         return @{ Status = 'ALREADY OK'; Detail = 'Agent present; service checked' }
     }
 
+    # Without the account token the agent installs but never joins the Knix
+    # account, which looks fine locally while protecting nothing centrally.
+    if ([string]::IsNullOrWhiteSpace($MalwarebytesToken)) {
+        return @{ Status = 'FAILED'; Detail = 'No Malwarebytes account token - set KNIX_MB_TOKEN in the Atera bootstrap' }
+    }
+
     $msi = Join-Path $Script:TempDir 'ThreatDownEA.msi'
     if (-not (Invoke-Download -Url 'https://ark.mwbsys.com/epa.win.installer.x64/release' -Destination $msi -MinBytes 1MB -TimeoutSec 600)) {
         return @{ Status = 'FAILED'; Detail = 'Installer download failed' }
@@ -2013,10 +2156,8 @@ Invoke-Step -Name 'Splashtop' -Body {
         return @{ Status = 'ALREADY OK'; Detail = 'Installed and enrolled with deployment code' }
     }
 
-    if ($isInstalled -and -not $isEnrolled) {
-        Write-Log 'Splashtop is installed but not enrolled - re-running installer with dcode to enrol in place.' 'WARN'
-    }
-
+    # Download and verify the installer BEFORE touching the existing Streamer,
+    # so a device is never left without one because the installer was missing.
     $exe = Join-Path $Script:TempDir 'SplashtopStreamer.exe'
     if (-not (Invoke-Download -Url $SplashtopInstallerUrl -Destination $exe -MinBytes 20MB -TimeoutSec 900)) {
         return @{ Status = 'FAILED'; Detail = 'Installer download failed' }
@@ -2027,31 +2168,47 @@ Invoke-Step -Name 'Splashtop' -Body {
         return @{ Status = 'FAILED'; Detail = 'Installer signature not valid - refused to run' }
     }
 
-    # Splashtop Easy Deployment syntax. dcode= tells the Streamer which team to
-    # join; without it the Streamer prompts for a code after install.
-    #
-    # Two traps this block avoids:
-    #
-    #  * prevercheck makes the installer SKIP itself when the same version is
-    #    already installed. Harmless on a fresh install, but on a repair -
-    #    Streamer present, code missing - it turns the whole run into a no-op.
-    #    So it is only used when the Streamer is not installed yet.
-    #
-    #  * The installer often stays resident after finishing, so success is
-    #    polled for rather than waited on. What is polled for is the DEPLOYMENT
-    #    CODE appearing - not merely the Streamer being on disk. An earlier
-    #    version polled for "installed", which on a repair is true within five
-    #    seconds, so the installer was killed ~50s in, before it had written
-    #    the code. That is why enrolment kept coming back False.
-    #
-    # NOTE: no uninstall first. Re-running over an existing install applies the
-    # deployment configuration and keeps the machine reachable throughout.
-    $codeArgs = "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1"
+    # --- Installed but not enrolled: uninstall, then install fresh -----------
+    # Splashtop's article "Command-line parameters to silently install your
+    # deployable Splashtop Streamer" says:
+    #   Easy Deployment:  "Upgrade is not supported using Easy Deployment."
+    #   12-digit upgrade: streamer.exe prevercheck /s /i hidewindow=1   (no dcode)
+    # So there is NO supported way to put a code onto an existing Streamer in
+    # place. That is why re-running the installer over the top never stuck.
+    # The documented route is uninstall, then a NEW install with dcode=.
+    if ($isInstalled -and -not $isEnrolled) {
 
+        if (-not $SplashtopReinstallIfNotEnrolled) {
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            Write-SplashtopDiagnostics
+            return @{ Status = 'FAILED'; Detail = "Installed without deployment code $SplashtopDeployCode; reinstall is turned off (SplashtopReinstallIfNotEnrolled)" }
+        }
+
+        Write-Log "Splashtop is installed WITHOUT deployment code $SplashtopDeployCode." 'WARN'
+        Write-Log 'Splashtop does not support adding a code to an existing install, so it will be uninstalled and reinstalled with the code.' 'WARN'
+
+        # Record what was there first - including which team, if any.
+        Write-SplashtopDiagnostics
+
+        if (-not (Uninstall-SplashtopStreamer)) {
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            return @{ Status = 'FAILED'; Detail = 'Existing Streamer could not be uninstalled, so the deployment code could not be applied' }
+        }
+    }
+
+    # --- New install with the deployment code --------------------------------
+    # Splashtop's documented syntax. prevercheck is marked REQUIRED.
+    #   streamer.exe prevercheck /s /i dcode=your_code,confirm_d=0,hidewindow=1
+    # The second set is the Easy Deployment form, for a package with the code
+    # built in.
+    #
+    # The installer often stays resident after finishing, so success is polled
+    # for. What is polled for is the deployment code appearing - not merely the
+    # Streamer being on disk, which once got the installer killed ~50s in,
+    # before it had written the code.
     $argSets = @()
-    if (-not $isInstalled) { $argSets += ,@('prevercheck', '/s', '/i', $codeArgs) }
-    $argSets += ,@('/s', '/i', $codeArgs)
-    $argSets += ,@('/s', '/i', 'confirm_d=0,hidewindow=1')   # deploy package: code is embedded
+    $argSets += ,@('prevercheck', '/s', '/i', "dcode=$SplashtopDeployCode,confirm_d=0,hidewindow=1")
+    $argSets += ,@('prevercheck', '/s', '/i', 'confirm_d=0,hidewindow=1')
 
     $enrolled = $false
     $attempt  = 0
@@ -2129,6 +2286,7 @@ Invoke-Step -Name 'CoreApps' -Body {
             Detect    = {
                 (Test-Path 'C:\Program Files\Google\Chrome\Application\chrome.exe') -or
                 (Test-Path 'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') -or
+                (Test-PerUserPath -RelativePath 'AppData\Local\Google\Chrome\Application\chrome.exe') -or
                 [bool](Get-InstalledApp -NameLike 'Google Chrome')
             }
         },
@@ -2214,6 +2372,20 @@ Invoke-Step -Name 'CoreApps' -Body {
         }
 
         Remove-Item $path -Force -ErrorAction SilentlyContinue
+
+        # The installer's exit code is not the last word. Google's Chrome MSI
+        # in particular can report failure after Chrome has in fact installed
+        # (its wrapper returns an error from a post-install action), which made
+        # this step say FAILED on a laptop where Chrome worked fine. So look
+        # at the machine before believing the exit code.
+        if (-not $ok) {
+            Start-Sleep -Seconds 5
+            if (& $app.Detect) {
+                $reported = if ($app.Kind -eq 'msi') { "exit $Script:LastMsiExitCode" } else { 'an error' }
+                Write-Log "$($app.Name): installer reported $reported, but the app IS installed - counting it as installed." 'WARN'
+                $ok = $true
+            }
+        }
 
         if (-not $ok) {
             if ($app.Kind -eq 'msi') { $failed += "$($app.Name) (installer exit $Script:LastMsiExitCode)" }
